@@ -275,6 +275,21 @@ export function registerSetup(server: McpServer): void {
       ensureDir(TOKENS_DIR);
 
       const secretPath = join(CONFIG_DIR, "client_secret.json");
+
+      // Always save channel config to channels.yaml — even if client_secret.json
+      // isn't ready yet. The channel info is known, and the paths are predictable.
+      let existing: any = { channels: {} };
+      if (existsSync(CONFIG_PATH)) {
+        existing = parse(readFileSync(CONFIG_PATH, "utf-8"));
+      }
+      existing.channels[channelKey] = {
+        channel_id: channelId,
+        token_file: join(TOKENS_DIR, `${channelKey}.json`),
+        client_secret: secretPath,
+        daily_quota_limit: 10000,
+      };
+      writeFileSync(CONFIG_PATH, stringify(existing), "utf-8");
+
       if (!existsSync(secretPath)) {
         return {
           content: [
@@ -283,8 +298,10 @@ export function registerSetup(server: McpServer): void {
               text: JSON.stringify(
                 {
                   status: "need_client_secret",
+                  configPath: CONFIG_PATH,
                   message:
-                    "Please complete the following steps:\n\n" +
+                    "Channel config saved to channels.yaml.\n\n" +
+                    "Now provide client_secret.json:\n\n" +
                     "1. Go to https://console.cloud.google.com/\n" +
                     "2. Create a new project (or select existing)\n" +
                     "3. Go to 'APIs & Services' → 'Library'\n" +
@@ -310,19 +327,6 @@ export function registerSetup(server: McpServer): void {
           ],
         };
       }
-
-      // Update or create channel config
-      let existing: any = { channels: {} };
-      if (existsSync(CONFIG_PATH)) {
-        existing = parse(readFileSync(CONFIG_PATH, "utf-8"));
-      }
-      existing.channels[channelKey] = {
-        channel_id: channelId,
-        token_file: join(TOKENS_DIR, `${channelKey}.json`),
-        client_secret: secretPath,
-        daily_quota_limit: 10000,
-      };
-      writeFileSync(CONFIG_PATH, stringify(existing), "utf-8");
 
       return {
         content: [
