@@ -19,6 +19,17 @@ function parseUrls(input: string): string[] {
     .filter((line) => line.startsWith("http"));
 }
 
+function safeEncodeUrl(rawUrl: string): string {
+  // Try as-is first (already encoded URLs should work)
+  try {
+    new URL(rawUrl);
+    return rawUrl;
+  } catch {
+    // URL contains unencoded characters (Chinese, spaces, etc.) — encode it
+    return encodeURI(rawUrl);
+  }
+}
+
 export function registerDownloadEpisodes(server: McpServer): void {
   server.tool(
     "download_episodes",
@@ -46,10 +57,23 @@ export function registerDownloadEpisodes(server: McpServer): void {
       const failed: string[] = [];
 
       for (let i = 0; i < urlList.length; i++) {
-        const url = urlList[i];
-        const urlObj = new URL(url);
-        const attname =
-          urlObj.searchParams.get("attname") || `episode_${i + 1}.mp4`;
+        const rawUrl = urlList[i];
+        const encodedUrl = safeEncodeUrl(rawUrl);
+        let attname: string;
+
+        try {
+          const urlObj = new URL(encodedUrl);
+          attname = urlObj.searchParams.get("attname") || `episode_${i + 1}.mp4`;
+        } catch {
+          // Fallback: extract filename from the path portion
+          try {
+            const pathPart = encodedUrl.split("?")[0];
+            attname = decodeURIComponent(basename(pathPart));
+          } catch {
+            attname = `episode_${i + 1}.mp4`;
+          }
+        }
+
         const outPath = join(targetDir, attname);
 
         if (existsSync(outPath) && statSync(outPath).size > 1_000_000) {
@@ -63,7 +87,7 @@ export function registerDownloadEpisodes(server: McpServer): void {
             "-o", outPath,
             "-f",
             "--max-time", "300",
-            url,
+            encodedUrl,
           ]);
           files.push(attname);
         } catch {

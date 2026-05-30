@@ -1,14 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { existsSync } from "node:fs";
-import { readdirSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { join, basename, extname } from "node:path";
 import { spawn } from "node:child_process";
 import { getContentDir } from "../config.js";
-import { ffmpegExtractAudio } from "../utils/ffmpeg.js";
 import { listVideoFiles, ensureDir } from "../utils/files.js";
 
-// ── separate_vocals: Fire-and-forget ─────────────────────────────────────────
+// ── separate_vocals: Fire-and-forget (truly immediate) ──────────────────────
 
 export function registerSeparateVocals(server: McpServer): void {
   server.tool(
@@ -47,32 +45,34 @@ export function registerSeparateVocals(server: McpServer): void {
         const tmpDir = join(outputDir, "_tmp", name);
         ensureDir(tmpDir);
         const audioWav = join(tmpDir, "audio.wav");
-
-        // Step 1: Extract audio synchronously (fast, ~seconds)
-        try {
-          await ffmpegExtractAudio(filePath, audioWav);
-        } catch (err: any) {
-          results.push({ name, status: `failed: extract - ${err.message}` });
-          continue;
-        }
-
-        // Step 2: Spawn demucs + mux as background process (minutes to hours)
         const demucsDoneFile = join(tmpDir, ".demucs_done");
         const vocalsDir = join(tmpDir, "htdemucs", "audio");
+        const logFile = join(tmpDir, "background.log");
 
+        // Write a "started" marker so check_vocals_status knows it's running
+        const startedFile = join(tmpDir, ".started");
+        writeFileSync(startedFile, new Date().toISOString());
+
+        // ── ALL heavy work (ffmpeg extract + demucs + mux) goes into background ──
         const shell = [
           `set -e`,
-          `echo "[demucs] Starting for ${name}..."`,
-          `demucs --two-stems=vocals -o "${tmpDir}" "${audioWav}"`,
-          `echo "[demucs] Demucs done, muxing..."`,
-          `ffmpeg -y -i "${filePath}" -i "${vocalsDir}/vocals.wav" -c:v copy -c:a aac -b:a 192k -map 0:v:0 -map 1:a:0 "${processedPath}"`,
+          `echo "[bg] Starting pipeline for ${name}..." > "${logFile}" 2>&1`,
+          // Step 1: Extract audio (previously awaited — now in background)
+          `echo "[bg] Extracting audio..." >> "${logFile}" 2>&1`,
+          `ffmpeg -y -i "${filePath}" -vn -acodec pcm_s16le -ar 44100 -ac 2 "${audioWav}" >> "${logFile}" 2>&1`,
+          `echo "[bg] Audio extracted." >> "${logFile}" 2>&1`,
+          // Step 2: Demucs vocal separation
+          `echo "[bg] Running Demucs..." >> "${logFile}" 2>&1`,
+          `demucs --two-stems=vocals -o "${tmpDir}" "${audioWav}" >> "${logFile}" 2>&1`,
+          `echo "[bg] Demucs done, muxing..." >> "${logFile}" 2>&1`,
+          // Step 3: Mux vocals back into video
+          `ffmpeg -y -i "${filePath}" -i "${vocalsDir}/vocals.wav" -c:v copy -c:a aac -b:a 192k -map 0:v:0 -map 1:a:0 "${processedPath}" >> "${logFile}" 2>&1`,
           `touch "${demucsDoneFile}"`,
-          `echo "[demucs] Complete: ${name}"`,
+          `echo "[bg] Complete: ${name}" >> "${logFile}" 2>&1`,
         ].join("\n");
 
         spawn("bash", ["-c", shell], { detached: true, stdio: "ignore" }).unref();
 
-        // ✅ Return immediately — do NOT await!
         results.push({ name, status: "started", processedPath });
       }
 
@@ -133,6 +133,7 @@ export function registerCheckVocalsStatus(server: McpServer): void {
         const processedPath = join(outputDir, `${name}_processed.mp4`);
         const tmpDir = join(outputDir, "_tmp", name);
         const demucsDoneFile = join(tmpDir, ".demucs_done");
+        const startedFile = join(tmpDir, ".started");
         const audioWav = join(tmpDir, "audio.wav");
 
         if (existsSync(processedPath)) {
@@ -140,8 +141,8 @@ export function registerCheckVocalsStatus(server: McpServer): void {
         } else if (existsSync(demucsDoneFile)) {
           // .demucs_done exists but processed file doesn't → mux may have failed
           results.push({ name, status: "failed", processedPath });
-        } else if (existsSync(audioWav)) {
-          // Audio extracted but demucs not done yet → running
+        } else if (existsSync(startedFile)) {
+          // Background process was started (includes audio extraction phase)
           results.push({ name, status: "running" });
         } else {
           results.push({ name, status: "pending" });
