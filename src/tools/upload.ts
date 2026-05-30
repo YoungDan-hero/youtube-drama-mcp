@@ -303,8 +303,6 @@ export function registerCheckUploadStatus(server: McpServer): void {
         };
       }
 
-      // 💡 完美移除：删掉了对 running 状态下超过 15 分钟无修改时间的强杀判定
-      // 现在的逻辑将无限期信任当前的上传任务状态，允许慢速大文件持续长跑。
       return {
         content: [
           { type: "text" as const, text: JSON.stringify(result, null, 2) },
