@@ -11,14 +11,14 @@ import { listVideoFiles, ensureDir } from "../utils/files.js";
 export function registerSeparateVocals(server: McpServer): void {
   server.tool(
     "separate_vocals",
-    "Start Demucs vocal separation in the BACKGROUND, then return immediately. Use check_vocals_status to poll.",
+    "Start Demucs vocal separation in the BACKGROUND, reading from {dramaId}/raw/. Returns immediately — use check_vocals_status to poll until allDone=true. After completion, call build_video with the same dramaId.",
     {
-      dramaId: z.string().describe("Drama ID"),
-      inputDir: z.string().describe("Directory containing raw episode MP4s"),
+      dramaId: z.string().describe("Drama ID (same as used in download_episodes)"),
       startEp: z.number().default(1).describe("Start episode number"),
       endEp: z.number().default(999).describe("End episode number"),
     },
-    async ({ dramaId, inputDir, startEp, endEp }) => {
+    async ({ dramaId, startEp, endEp }) => {
+      const inputDir = join(getContentDir(dramaId), "raw");
       const outputDir = join(getContentDir(dramaId), "processed");
       ensureDir(outputDir);
 
@@ -102,7 +102,7 @@ export function registerSeparateVocals(server: McpServer): void {
 export function registerCheckVocalsStatus(server: McpServer): void {
   server.tool(
     "check_vocals_status",
-    "Check the status of background vocal separation tasks. Returns 'running', 'completed', or 'pending' for each episode.",
+    "Poll vocal separation progress. Call repeatedly (every 30-60s) until allDone=true. Returns 'completed', 'running', or 'pending' per episode. Only proceed to build_video when allDone=true.",
     {
       dramaId: z.string().describe("Drama ID"),
     },

@@ -33,16 +33,15 @@ function safeEncodeUrl(rawUrl: string): string {
 export function registerDownloadEpisodes(server: McpServer): void {
   server.tool(
     "download_episodes",
-    "Download drama episodes from NetShort signed URLs",
+    "Download drama episodes to {dramaId}/raw/. Always use default path — do NOT specify outputDir. Next step after download: call separate_vocals with the same dramaId.",
     {
       urls: z
         .string()
         .describe("URL list (newline-separated) or path to a txt file"),
       dramaId: z.string().describe("Drama ID, e.g. N193"),
-      outputDir: z.string().optional().describe("Output directory"),
     },
-    async ({ urls, dramaId, outputDir }) => {
-      const targetDir = outputDir || join(getContentDir(dramaId), "raw");
+    async ({ urls, dramaId }) => {
+      const targetDir = join(getContentDir(dramaId), "raw");
       ensureDir(targetDir);
 
       const urlList = parseUrls(urls);

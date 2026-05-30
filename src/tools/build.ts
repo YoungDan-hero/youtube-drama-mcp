@@ -13,10 +13,9 @@ import { listVideoFiles, ensureDir } from "../utils/files.js";
 export function registerBuildVideo(server: McpServer): void {
   server.tool(
     "build_video",
-    "Concatenate processed episodes into a single final video",
+    "Concatenate processed episodes from {dramaId}/processed/ into a single final video at {dramaId}/output/{dramaId}-final.mp4. Only call AFTER check_vocals_status returns allDone=true. After build, call upload_video with the same dramaId.",
     {
-      dramaId: z.string().describe("Drama ID"),
-      inputDir: z.string().describe("Directory with processed episode MP4s"),
+      dramaId: z.string().describe("Drama ID (same as used in download/separate_vocals)"),
       title: z.string().describe("Video title"),
       description: z.string().describe("Video description"),
       tags: z.string().describe("Comma-separated tags"),
@@ -27,7 +26,8 @@ export function registerBuildVideo(server: McpServer): void {
       intro: z.string().optional().describe("Intro video path"),
       outro: z.string().optional().describe("Outro video path"),
     },
-    async ({ dramaId, inputDir, audioMode, intro, outro }) => {
+    async ({ dramaId, audioMode, intro, outro }) => {
+      const inputDir = join(getContentDir(dramaId), "processed");
       const outputDir = join(getContentDir(dramaId), "output");
       ensureDir(outputDir);
 

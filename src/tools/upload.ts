@@ -14,9 +14,9 @@ import { uploadVideo, setPublic as ytSetPublic } from "../youtube/client.js";
 export function registerUploadVideo(server: McpServer): void {
   server.tool(
     "upload_video",
-    "Start YouTube upload in the BACKGROUND, then return immediately. Use check_upload_status to poll.",
+    "Upload {dramaId}/output/{dramaId}-final.mp4 to YouTube. Starts upload in BACKGROUND — use check_upload_status to poll until complete. Only call AFTER build_video succeeds.",
     {
-      videoPath: z.string().describe("Path to the video file"),
+      dramaId: z.string().describe("Drama ID (same as used in download/separate/build)"),
       channelKey: z.string().describe("Channel key from channels.yaml"),
       title: z.string().describe("Video title"),
       description: z.string().describe("Video description"),
@@ -26,7 +26,32 @@ export function registerUploadVideo(server: McpServer): void {
         .default("private")
         .describe("Privacy status"),
     },
-    async ({ videoPath, channelKey, title, description, tags, privacy }) => {
+    async ({ dramaId, channelKey, title, description, tags, privacy }) => {
+      const videoPath = join(
+        homedir(),
+        ".youtube-drama-mcp",
+        "content",
+        dramaId,
+        "output",
+        `${dramaId}-final.mp4`
+      );
+
+      if (!existsSync(videoPath)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                { ok: false, error: `Video not found: ${videoPath}. Run build_video first.` },
+                null,
+                2
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
+
       const resultFile = join(
         homedir(),
         ".youtube-drama-mcp",
@@ -114,7 +139,7 @@ export function registerUploadVideo(server: McpServer): void {
 export function registerCheckUploadStatus(server: McpServer): void {
   server.tool(
     "check_upload_status",
-    "Check the status of a background YouTube upload by its result file path. Returns the upload result if completed.",
+    "Poll YouTube upload progress. Call repeatedly (every 30-60s) until result file appears with ok=true. Use the resultFile path returned by upload_video.",
     {
       resultFile: z.string().describe("Result file path returned by upload_video"),
     },
