@@ -2,9 +2,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerDownloadEpisodes } from "./tools/download.js";
-import { registerSeparateVocals } from "./tools/vocals.js";
+import { registerSeparateVocals, registerCheckVocalsStatus } from "./tools/vocals.js";
 import { registerBuildVideo } from "./tools/build.js";
-import { registerUploadVideo, registerSetPublic } from "./tools/upload.js";
+import { registerUploadVideo, registerSetPublic, registerCheckUploadStatus } from "./tools/upload.js";
 import { registerSetThumbnail } from "./tools/thumbnail.js";
 import { registerPullAnalytics } from "./tools/analytics.js";
 import { registerGetQuotaStatus } from "./tools/quota.js";
@@ -17,8 +17,10 @@ const server = new McpServer({
 
 registerDownloadEpisodes(server);
 registerSeparateVocals(server);
+registerCheckVocalsStatus(server);
 registerBuildVideo(server);
 registerUploadVideo(server);
+registerCheckUploadStatus(server);
 registerSetPublic(server);
 registerSetThumbnail(server);
 registerPullAnalytics(server);
