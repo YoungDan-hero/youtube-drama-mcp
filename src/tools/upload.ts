@@ -11,11 +11,11 @@ import { setPublic as ytSetPublic } from "../youtube/client.js";
 import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-// ── 🌟 子进程执行分支（真正的后台上传逻辑，完全脱离 MCP 宿主） ────────────────
+// ── 🌟 子进程执行分支（后台真正上传逻辑，免疫双引号与百分比暴走） ───────────
 if (process.argv[2] === "--worker-mode" && process.argv[3]) {
   let payload: any;
   try {
-    // 💡 完美修复：先用 Base64 解码，再解析 JSON，彻底免疫操作系统的双引号干扰 Bug
+    // 1. Base64 安全解码参数
     const decodedJson = Buffer.from(process.argv[3], "base64").toString(
       "utf-8",
     );
@@ -39,7 +39,7 @@ if (process.argv[2] === "--worker-mode" && process.argv[3]) {
 
     const youtube = google.youtube({ version: "v3", auth });
 
-    // 💡 完美修复：引入官方 onUploadProgress 监听器，让上传过程变成“可见的百分比”
+    // 2. 带有防爆计算的进度流上传
     const resp = await youtube.videos.insert(
       {
         part: ["snippet", "status"],
@@ -51,19 +51,28 @@ if (process.argv[2] === "--worker-mode" && process.argv[3]) {
       },
       {
         onUploadProgress: (evt) => {
-          const progress = Math.round(
-            (evt.bytesRead / (evt.totalBytes || 1)) * 100,
-          );
           try {
-            // 实时冲刷改写本地 JSON 文件，让 check_upload_status 工具能读到动态进度
+            let progressStr = "0%";
+
+            // 💡 健壮性修复：只有当总大小明确存在且大于 0 时才计算百分比
+            if (evt.totalBytes && evt.totalBytes > 0) {
+              const progress = Math.round(
+                (evt.bytesRead / evt.totalBytes) * 100,
+              );
+              progressStr = `${progress}%`;
+            } else {
+              // 💡 优雅降级：若 totalBytes 为 undefined，则精细化显示已上传的兆字节 (MB)
+              progressStr = `${(evt.bytesRead / 1024 / 1024).toFixed(1)} MB transmitted`;
+            }
+
             writeFileSync(
               resultFile,
               JSON.stringify(
                 {
                   ok: false,
                   status: "running",
-                  progress: `${progress}%`,
-                  message: `Uploading bytes: ${evt.bytesRead}/${evt.totalBytes}`,
+                  progress: progressStr,
+                  message: `Uploading bytes: ${evt.bytesRead} / ${evt.totalBytes ?? "Unknown"}`,
                 },
                 null,
                 2,
@@ -78,7 +87,7 @@ if (process.argv[2] === "--worker-mode" && process.argv[3]) {
     const videoId = resp.data.id!;
     recordQuotaUsage(channelKey, "upload", 1600, videoId);
 
-    // ✅ 真正上传成功：落盘终点站状态
+    // ✅ 上传完美成功
     writeFileSync(
       resultFile,
       JSON.stringify(
@@ -90,7 +99,7 @@ if (process.argv[2] === "--worker-mode" && process.argv[3]) {
     );
     process.exit(0);
   } catch (err: any) {
-    // ❌ 上传中途失败：极力确保将真实的报错写回结果文件，防止 AI 无限死等
+    // ❌ 极力捕获异常写回本地
     try {
       const targetFile =
         payload?.resultFile ||
@@ -157,7 +166,6 @@ export function registerUploadVideo(server: McpServer): void {
         };
       }
 
-      // 用精确的时间戳作为结果文件名，防止多任务并发冲突
       const timestamp = Date.now();
       const resultFile = join(
         homedir(),
@@ -185,7 +193,7 @@ export function registerUploadVideo(server: McpServer): void {
       );
       if (!quotaCheck.ok) throw new Error(quotaCheck.message);
 
-      // 💡 抄人声分离满分作业：在 fork 子进程之前，先创建一个占位的初始状态文件落盘
+      // 先落地一个初始状态文件
       writeFileSync(
         resultFile,
         JSON.stringify(
@@ -216,19 +224,18 @@ export function registerUploadVideo(server: McpServer): void {
         tokens: client.credentials,
       };
 
-      // 💡 完美修复：把复杂的 Payload 对象整体转为安全的 Base64 字符串，避开命令行双引号地狱
+      // 对象转为坚固的 Base64 字符串
       const base64Payload = Buffer.from(JSON.stringify(workerPayload)).toString(
         "base64",
       );
 
       const child = fork(currentFilePath, ["--worker-mode", base64Payload], {
-        detached: true, // 彻底脱离 MCP 父进程的主控生命周期
-        stdio: "ignore", // 忽略标准输入输出，由进程内部自行通过落盘进行文件通信
+        detached: true,
+        stdio: "ignore",
       });
 
-      child.unref(); // 掐断事件循环中的强引用计数
+      child.unref();
 
-      // ✅ 100 毫秒内迅速返回，确保 MCP 客户端永远不会发生 Timeout 超时
       return {
         content: [
           {
@@ -265,7 +272,6 @@ export function registerCheckUploadStatus(server: McpServer): void {
         .describe("Result file path returned by upload_video"),
     },
     async ({ resultFile }) => {
-      // 如果文件离奇不存在，说明子进程可能连刚开始的写盘都遭遇了权限错误
       if (!existsSync(resultFile)) {
         return {
           content: [
@@ -287,7 +293,7 @@ export function registerCheckUploadStatus(server: McpServer): void {
 
       const result = JSON.parse(readFileSync(resultFile, "utf-8"));
 
-      // 1. 如果子进程已经安全着陆（成功或失败），直接告诉 AI 最终答案
+      // 💡 精简逻辑：如果子进程已经明确写回了结果（completed 或 failed），直接给 AI 最终答复
       if (result.status === "completed" || result.status === "failed") {
         return {
           content: [
@@ -297,35 +303,8 @@ export function registerCheckUploadStatus(server: McpServer): void {
         };
       }
 
-      // 2. 如果状态是 "running"，引入时间触觉，防止子进程意外死掉导致 AI 傻等
-      if (result.status === "running") {
-        const fs = await import("node:fs");
-        const stats = fs.statSync(resultFile);
-        const minutesSinceLastUpdate = (Date.now() - stats.mtimeMs) / 1000 / 60;
-
-        // 如果这个状态文件超过 15 分钟没有任何数据写入（修改时间未变），说明子进程网络彻底锁死或被系统强杀了
-        if (minutesSinceLastUpdate > 15) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: JSON.stringify(
-                  {
-                    status: "failed",
-                    error:
-                      "The upload background worker has frozen or crashed (no disk activity for 15 minutes).",
-                  },
-                  null,
-                  2,
-                ),
-              },
-            ],
-            isError: true,
-          };
-        }
-      }
-
-      // 3. 正常运行中，会原封不动返回带有 {"progress": "45%"} 的动态数据反馈给 AI
+      // 💡 完美移除：删掉了对 running 状态下超过 15 分钟无修改时间的强杀判定
+      // 现在的逻辑将无限期信任当前的上传任务状态，允许慢速大文件持续长跑。
       return {
         content: [
           { type: "text" as const, text: JSON.stringify(result, null, 2) },
@@ -335,23 +314,4 @@ export function registerCheckUploadStatus(server: McpServer): void {
   );
 }
 
-// ── set_public: 修改视频隐私状态 ──────────────────────────────────────────
-
-export function registerSetPublic(server: McpServer): void {
-  server.tool(
-    "set_public",
-    "Change a YouTube video from private to public",
-    {
-      videoId: z.string().describe("YouTube video ID"),
-      channelKey: z.string().describe("Channel key"),
-    },
-    async ({ videoId, channelKey }) => {
-      const result = await ytSetPublic(channelKey, videoId);
-      return {
-        content: [
-          { type: "text" as const, text: JSON.stringify(result, null, 2) },
-        ],
-      };
-    },
-  );
-}
+// ── set_public: 修改视频隐私状态
