@@ -7,16 +7,86 @@ import { google } from "googleapis";
 import { getChannel } from "../config.js";
 import { ensureValidToken } from "../youtube/auth.js";
 import { recordQuotaUsage, checkQuotaAvailable } from "../youtube/quota.js";
-import { uploadVideo, setPublic as ytSetPublic } from "../youtube/client.js";
+import { setPublic as ytSetPublic } from "../youtube/client.js";
+import { fork } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-// ── upload_video: Fire-and-forget ────────────────────────────────────────────
+// ── 🌟 子进程执行分支（真正的后台上传逻辑） ──────────────────────────────────
+if (process.argv[2] === "--worker-mode" && process.argv[3]) {
+  let payload: any;
+  try {
+    payload = JSON.parse(process.argv[3]);
+    const {
+      videoPath,
+      resultFile,
+      channelKey,
+      title,
+      description,
+      tagsArray,
+      privacy,
+      ch,
+      tokens,
+    } = payload;
+    const { createReadStream } = await import("node:fs");
+
+    const auth = new google.auth.OAuth2(ch.clientId, ch.clientSecret);
+    auth.setCredentials(tokens);
+
+    const youtube = google.youtube({ version: "v3", auth });
+
+    const resp = await youtube.videos.insert({
+      part: ["snippet", "status"],
+      requestBody: {
+        snippet: { title, description, tags: tagsArray },
+        status: { privacyStatus: privacy },
+      },
+      media: { body: createReadStream(videoPath) },
+    });
+
+    const videoId = resp.data.id!;
+    recordQuotaUsage(channelKey, "upload", 1600, videoId);
+
+    // 💡 成功：写入带 status 的明确 JSON
+    writeFileSync(
+      resultFile,
+      JSON.stringify(
+        { ok: true, status: "completed", videoId, channelId: ch.channelId },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    process.exit(0);
+  } catch (err: any) {
+    // 💡 失败：极力确保把错误写回结果文件，打破死循环
+    try {
+      const targetFile =
+        payload?.resultFile ||
+        join(homedir(), ".youtube-drama-mcp", `upload-error-fallback.json`);
+      writeFileSync(
+        targetFile,
+        JSON.stringify(
+          { ok: false, status: "failed", error: err.message ?? String(err) },
+          null,
+          2,
+        ),
+        "utf-8",
+      );
+    } catch (_) {}
+    process.exit(1);
+  }
+}
+
+// ── upload_video: 唤醒并脱离 (Fork & Detach) ───────────────────────────
 
 export function registerUploadVideo(server: McpServer): void {
   server.tool(
     "upload_video",
     "Upload {dramaId}/output/{dramaId}-final.mp4 to YouTube. Starts upload in BACKGROUND — use check_upload_status to poll until complete. Only call AFTER build_video succeeds.",
     {
-      dramaId: z.string().describe("Drama ID (same as used in download/separate/build)"),
+      dramaId: z
+        .string()
+        .describe("Drama ID (same as used in download/separate/build)"),
       channelKey: z.string().describe("Channel key from channels.yaml"),
       title: z.string().describe("Video title"),
       description: z.string().describe("Video description"),
@@ -33,7 +103,7 @@ export function registerUploadVideo(server: McpServer): void {
         "content",
         dramaId,
         "output",
-        `${dramaId}-final.mp4`
+        `${dramaId}-final.mp4`,
       );
 
       if (!existsSync(videoPath)) {
@@ -42,9 +112,9 @@ export function registerUploadVideo(server: McpServer): void {
             {
               type: "text" as const,
               text: JSON.stringify(
-                { ok: false, error: `Video not found: ${videoPath}. Run build_video first.` },
+                { ok: false, error: `Video not found: ${videoPath}.` },
                 null,
-                2
+                2,
               ),
             },
           ],
@@ -52,13 +122,14 @@ export function registerUploadVideo(server: McpServer): void {
         };
       }
 
+      // 💡 保持结果文件名的一致性
+      const timestamp = Date.now();
       const resultFile = join(
         homedir(),
         ".youtube-drama-mcp",
-        `upload-result-${Date.now()}.json`
+        `upload-result-${timestamp}.json`,
       );
 
-      // Pre-flight: auth, verify, quota (synchronous, fast)
       const ch = getChannel(channelKey);
       const client = await ensureValidToken(ch.tokenFile, ch.clientSecret);
       const youtube = google.youtube({ version: "v3", auth: client });
@@ -72,45 +143,54 @@ export function registerUploadVideo(server: McpServer): void {
         throw new Error(`Channel ID mismatch: ${ch.channelId} vs ${actualId}`);
       }
 
-      const quotaCheck = checkQuotaAvailable(channelKey, "upload", ch.dailyQuotaLimit);
+      const quotaCheck = checkQuotaAvailable(
+        channelKey,
+        "upload",
+        ch.dailyQuotaLimit,
+      );
       if (!quotaCheck.ok) throw new Error(quotaCheck.message);
 
+      // 💡 抄 Demucs 脚本的满分作业：在 fork 之前，先写一个带有 "running" 状态的初始文件落盘！
+      writeFileSync(
+        resultFile,
+        JSON.stringify(
+          {
+            ok: false,
+            status: "running",
+            message: "Network transferring to YouTube...",
+          },
+          null,
+          2,
+        ),
+        "utf-8",
+      );
+
       const tagsArray = tags.split(",").map((t) => t.trim());
-      const { createReadStream } = await import("node:fs");
+      const currentFilePath = fileURLToPath(import.meta.url);
 
-      // Fire the upload (runs asynchronously via Google API client)
-      const uploadPromise = youtube.videos.insert({
-        part: ["snippet", "status"],
-        requestBody: {
-          snippet: { title, description, tags: tagsArray },
-          status: { privacyStatus: privacy as any },
+      const workerPayload = {
+        videoPath,
+        resultFile,
+        channelKey,
+        title,
+        description,
+        tagsArray,
+        privacy,
+        ch: { channelId: ch.channelId, clientSecret: ch.clientSecret },
+        tokens: client.credentials,
+      };
+
+      const child = fork(
+        currentFilePath,
+        ["--worker-mode", JSON.stringify(workerPayload)],
+        {
+          detached: true,
+          stdio: "ignore",
         },
-        media: { body: createReadStream(videoPath) },
-      });
+      );
 
-      // Write result file when upload completes (success or failure)
-      uploadPromise
-        .then((resp) => {
-          const videoId = resp.data.id!;
-          recordQuotaUsage(channelKey, "upload", 1600, videoId);
-          writeFileSync(
-            resultFile,
-            JSON.stringify({ ok: true, videoId, channelId: ch.channelId }, null, 2),
-            "utf-8"
-          );
-        })
-        .catch((err: any) => {
-          writeFileSync(
-            resultFile,
-            JSON.stringify({ ok: false, error: err.message ?? String(err) }, null, 2),
-            "utf-8"
-          );
-        });
+      child.unref();
 
-      // Prevent GC while uploading
-      (globalThis as any).__bgUpload = uploadPromise;
-
-      // ✅ Return immediately — result will be written to resultFile when done
       return {
         content: [
           {
@@ -118,30 +198,29 @@ export function registerUploadVideo(server: McpServer): void {
             text: JSON.stringify(
               {
                 ok: true,
-                message: "Upload started in background. Use check_upload_status to monitor.",
+                message: "Upload task safe spawned into system background.",
                 resultFile,
-                channelKey,
-                title,
-                privacy,
               },
               null,
-              2
+              2,
             ),
           },
         ],
       };
-    }
+    },
   );
 }
 
-// ── check_upload_status: Poll for upload completion ──────────────────────────
+// ── check_upload_status: 智能状态提取 ──────────────────────────────────────────
 
 export function registerCheckUploadStatus(server: McpServer): void {
   server.tool(
     "check_upload_status",
-    "Poll YouTube upload progress. Call repeatedly (every 30-60s) until result file appears with ok=true. Use the resultFile path returned by upload_video.",
+    "Poll YouTube upload progress. Call repeatedly (every 30-60s) until result file appears with status='completed'.",
     {
-      resultFile: z.string().describe("Result file path returned by upload_video"),
+      resultFile: z
+        .string()
+        .describe("Result file path returned by upload_video"),
     },
     async ({ resultFile }) => {
       if (!existsSync(resultFile)) {
@@ -150,25 +229,31 @@ export function registerCheckUploadStatus(server: McpServer): void {
             {
               type: "text" as const,
               text: JSON.stringify(
-                { status: "uploading", message: "Still uploading..." },
+                { status: "pending", message: "Process init..." },
                 null,
-                2
+                2,
               ),
             },
           ],
         };
       }
 
+      // 💡 读取文件中的实时状态
       const result = JSON.parse(readFileSync(resultFile, "utf-8"));
+
+      // 如果子进程还在传输，result.status 会是 "running"
+      // 如果传输结束，会变成 "completed" 或者 "failed"
       return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-        ...(result.ok ? {} : { isError: true }),
+        content: [
+          { type: "text" as const, text: JSON.stringify(result, null, 2) },
+        ],
+        ...(result.status === "failed" ? { isError: true } : {}),
       };
-    }
+    },
   );
 }
 
-// ── set_public: Fast API call, no change needed ──────────────────────────────
+// ── set_public: 保持原样 ──────────────────────────────────────────────
 
 export function registerSetPublic(server: McpServer): void {
   server.tool(
@@ -181,8 +266,10 @@ export function registerSetPublic(server: McpServer): void {
     async ({ videoId, channelKey }) => {
       const result = await ytSetPublic(channelKey, videoId);
       return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        content: [
+          { type: "text" as const, text: JSON.stringify(result, null, 2) },
+        ],
       };
-    }
+    },
   );
 }
