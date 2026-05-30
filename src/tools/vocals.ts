@@ -1,19 +1,18 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join, basename, extname } from "node:path";
+import { spawn } from "node:child_process";
 import { getContentDir } from "../config.js";
 import {
   ffmpegExtractAudio,
-  ffmpegMuxAudioVideo,
 } from "../utils/ffmpeg.js";
-import { separateVocals } from "../utils/demucs.js";
 import { listVideoFiles, ensureDir } from "../utils/files.js";
 
 export function registerSeparateVocals(server: McpServer): void {
   server.tool(
     "separate_vocals",
-    "Run Demucs vocal separation on drama episodes",
+    "Run Demucs vocal separation on drama episodes (background)",
     {
       dramaId: z.string().describe("Drama ID"),
       inputDir: z.string().describe("Directory containing raw episode MP4s"),
@@ -33,16 +32,14 @@ export function registerSeparateVocals(server: McpServer): void {
         };
       }
 
-      const processed: string[] = [];
-      const failed: { file: string; error: string }[] = [];
-      const skipped: string[] = [];
+      const tasks: { name: string; status: string }[] = [];
 
       for (const filePath of files) {
         const name = basename(filePath, extname(filePath));
         const processedPath = join(outputDir, `${name}_processed.mp4`);
 
         if (existsSync(processedPath)) {
-          skipped.push(name);
+          tasks.push({ name, status: "skipped (already processed)" });
           continue;
         }
 
@@ -53,22 +50,27 @@ export function registerSeparateVocals(server: McpServer): void {
         try {
           await ffmpegExtractAudio(filePath, audioWav);
         } catch (err: any) {
-          failed.push({ file: name, error: `Extract audio: ${err.message}` });
+          tasks.push({ name, status: `failed: extract audio - ${err.message}` });
           continue;
         }
 
-        const result = await separateVocals(audioWav, tmpDir);
-        if (!result.success) {
-          failed.push({ file: name, error: result.error ?? "Demucs failed" });
-          continue;
-        }
+        // Spawn demucs + mux as background shell process
+        const demucsDoneFile = join(tmpDir, ".demucs_done");
+        const shell = `
+          set -e
+          demucs --two-stems=vocals -o "${tmpDir}" "${audioWav}" 2>&1
+          VOCALS="${tmpDir}/htdemucs/${name}/vocals.wav"
+          ffmpeg -y -i "${filePath}" -i "$VOCALS" -c:v copy -c:a aac -b:a 192k -map 0:v:0 -map 1:a:0 "${processedPath}" 2>&1
+          touch "${demucsDoneFile}"
+        `;
 
-        try {
-          await ffmpegMuxAudioVideo(filePath, result.vocalsPath, processedPath);
-          processed.push(name);
-        } catch (err: any) {
-          failed.push({ file: name, error: `Mux: ${err.message}` });
-        }
+        const child = spawn("bash", ["-c", shell], {
+          detached: true,
+          stdio: "ignore",
+        });
+        child.unref();
+
+        tasks.push({ name, status: `started (background, check ${demucsDoneFile})` });
       }
 
       return {
@@ -79,10 +81,8 @@ export function registerSeparateVocals(server: McpServer): void {
               {
                 dramaId,
                 outputDir,
-                processed: processed.length,
-                skipped: skipped.length,
-                failed: failed.length,
-                failedDetails: failed,
+                tasks,
+                message: "Demucs running in background. Processed files appear when done.",
               },
               null,
               2
