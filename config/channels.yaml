@@ -1,6 +1,0 @@
-channels:
-  test:
-    channel_id: "UC6yao038-eVeUWalE95Vf4Q"
-    token_file: "~/.youtube-drama-mcp/tokens/test.json"
-    client_secret: "~/.youtube-drama-mcp/client_secret.json"
-    daily_quota_limit: 10000

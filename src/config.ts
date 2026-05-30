@@ -16,7 +16,7 @@ export interface AppConfig {
 }
 
 const DATA_DIR = join(homedir(), ".youtube-drama-mcp");
-const CONFIG_PATH = join(process.cwd(), "config", "channels.yaml");
+const CONFIG_PATH = join(DATA_DIR, "channels.yaml");
 
 let cached: AppConfig | null = null;
 

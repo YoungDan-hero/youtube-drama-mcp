@@ -97,7 +97,7 @@ const ERROR_HTML = `<!DOCTYPE html>
 // ── Constants ────────────────────────────────────────────────────
 const CONFIG_DIR = join(homedir(), ".youtube-drama-mcp");
 const TOKENS_DIR = join(CONFIG_DIR, "tokens");
-const CONFIG_PATH = join(process.cwd(), "config", "channels.yaml");
+const CONFIG_PATH = join(CONFIG_DIR, "channels.yaml");
 const OAUTH_PORT = 8765;
 const OAUTH_TIMEOUT_MS = 300_000; // 5 minutes
 const SCOPES = [
