@@ -11,11 +11,16 @@ import { setPublic as ytSetPublic } from "../youtube/client.js";
 import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-// ── 🌟 子进程执行分支（真正的后台上传逻辑） ──────────────────────────────────
+// ── 🌟 子进程执行分支（真正的后台上传逻辑，完全脱离 MCP 宿主） ────────────────
 if (process.argv[2] === "--worker-mode" && process.argv[3]) {
   let payload: any;
   try {
-    payload = JSON.parse(process.argv[3]);
+    // 💡 完美修复：先用 Base64 解码，再解析 JSON，彻底免疫操作系统的双引号干扰 Bug
+    const decodedJson = Buffer.from(process.argv[3], "base64").toString(
+      "utf-8",
+    );
+    payload = JSON.parse(decodedJson);
+
     const {
       videoPath,
       resultFile,
@@ -34,19 +39,46 @@ if (process.argv[2] === "--worker-mode" && process.argv[3]) {
 
     const youtube = google.youtube({ version: "v3", auth });
 
-    const resp = await youtube.videos.insert({
-      part: ["snippet", "status"],
-      requestBody: {
-        snippet: { title, description, tags: tagsArray },
-        status: { privacyStatus: privacy },
+    // 💡 完美修复：引入官方 onUploadProgress 监听器，让上传过程变成“可见的百分比”
+    const resp = await youtube.videos.insert(
+      {
+        part: ["snippet", "status"],
+        requestBody: {
+          snippet: { title, description, tags: tagsArray },
+          status: { privacyStatus: privacy },
+        },
+        media: { body: createReadStream(videoPath) },
       },
-      media: { body: createReadStream(videoPath) },
-    });
+      {
+        onUploadProgress: (evt) => {
+          const progress = Math.round(
+            (evt.bytesRead / (evt.totalBytes || 1)) * 100,
+          );
+          try {
+            // 实时冲刷改写本地 JSON 文件，让 check_upload_status 工具能读到动态进度
+            writeFileSync(
+              resultFile,
+              JSON.stringify(
+                {
+                  ok: false,
+                  status: "running",
+                  progress: `${progress}%`,
+                  message: `Uploading bytes: ${evt.bytesRead}/${evt.totalBytes}`,
+                },
+                null,
+                2,
+              ),
+              "utf-8",
+            );
+          } catch (_) {}
+        },
+      },
+    );
 
     const videoId = resp.data.id!;
     recordQuotaUsage(channelKey, "upload", 1600, videoId);
 
-    // 💡 成功：写入带 status 的明确 JSON
+    // ✅ 真正上传成功：落盘终点站状态
     writeFileSync(
       resultFile,
       JSON.stringify(
@@ -58,7 +90,7 @@ if (process.argv[2] === "--worker-mode" && process.argv[3]) {
     );
     process.exit(0);
   } catch (err: any) {
-    // 💡 失败：极力确保把错误写回结果文件，打破死循环
+    // ❌ 上传中途失败：极力确保将真实的报错写回结果文件，防止 AI 无限死等
     try {
       const targetFile =
         payload?.resultFile ||
@@ -112,7 +144,10 @@ export function registerUploadVideo(server: McpServer): void {
             {
               type: "text" as const,
               text: JSON.stringify(
-                { ok: false, error: `Video not found: ${videoPath}.` },
+                {
+                  ok: false,
+                  error: `Video not found: ${videoPath}. Run build_video first.`,
+                },
                 null,
                 2,
               ),
@@ -122,7 +157,7 @@ export function registerUploadVideo(server: McpServer): void {
         };
       }
 
-      // 💡 保持结果文件名的一致性
+      // 用精确的时间戳作为结果文件名，防止多任务并发冲突
       const timestamp = Date.now();
       const resultFile = join(
         homedir(),
@@ -150,14 +185,15 @@ export function registerUploadVideo(server: McpServer): void {
       );
       if (!quotaCheck.ok) throw new Error(quotaCheck.message);
 
-      // 💡 抄 Demucs 脚本的满分作业：在 fork 之前，先写一个带有 "running" 状态的初始文件落盘！
+      // 💡 抄人声分离满分作业：在 fork 子进程之前，先创建一个占位的初始状态文件落盘
       writeFileSync(
         resultFile,
         JSON.stringify(
           {
             ok: false,
             status: "running",
-            message: "Network transferring to YouTube...",
+            progress: "0%",
+            message: "Spawning background upload worker...",
           },
           null,
           2,
@@ -180,17 +216,19 @@ export function registerUploadVideo(server: McpServer): void {
         tokens: client.credentials,
       };
 
-      const child = fork(
-        currentFilePath,
-        ["--worker-mode", JSON.stringify(workerPayload)],
-        {
-          detached: true,
-          stdio: "ignore",
-        },
+      // 💡 完美修复：把复杂的 Payload 对象整体转为安全的 Base64 字符串，避开命令行双引号地狱
+      const base64Payload = Buffer.from(JSON.stringify(workerPayload)).toString(
+        "base64",
       );
 
-      child.unref();
+      const child = fork(currentFilePath, ["--worker-mode", base64Payload], {
+        detached: true, // 彻底脱离 MCP 父进程的主控生命周期
+        stdio: "ignore", // 忽略标准输入输出，由进程内部自行通过落盘进行文件通信
+      });
 
+      child.unref(); // 掐断事件循环中的强引用计数
+
+      // ✅ 100 毫秒内迅速返回，确保 MCP 客户端永远不会发生 Timeout 超时
       return {
         content: [
           {
@@ -198,8 +236,12 @@ export function registerUploadVideo(server: McpServer): void {
             text: JSON.stringify(
               {
                 ok: true,
-                message: "Upload task safe spawned into system background.",
+                message:
+                  "Upload task safely spawned into system background. Monitor progress via check_upload_status.",
                 resultFile,
+                channelKey,
+                title,
+                privacy,
               },
               null,
               2,
@@ -211,49 +253,89 @@ export function registerUploadVideo(server: McpServer): void {
   );
 }
 
-// ── check_upload_status: 智能状态提取 ──────────────────────────────────────────
+// ── check_upload_status: 智能状态与进度追踪工具 ────────────────────────────
 
 export function registerCheckUploadStatus(server: McpServer): void {
   server.tool(
     "check_upload_status",
-    "Poll YouTube upload progress. Call repeatedly (every 30-60s) until result file appears with status='completed'.",
+    "Poll YouTube upload progress. Call repeatedly (every 30-60s) until status becomes 'completed'.",
     {
       resultFile: z
         .string()
         .describe("Result file path returned by upload_video"),
     },
     async ({ resultFile }) => {
+      // 如果文件离奇不存在，说明子进程可能连刚开始的写盘都遭遇了权限错误
       if (!existsSync(resultFile)) {
         return {
           content: [
             {
               type: "text" as const,
               text: JSON.stringify(
-                { status: "pending", message: "Process init..." },
+                {
+                  status: "failed",
+                  error: "Local state tracking file went missing.",
+                },
                 null,
                 2,
               ),
             },
           ],
+          isError: true,
         };
       }
 
-      // 💡 读取文件中的实时状态
       const result = JSON.parse(readFileSync(resultFile, "utf-8"));
 
-      // 如果子进程还在传输，result.status 会是 "running"
-      // 如果传输结束，会变成 "completed" 或者 "failed"
+      // 1. 如果子进程已经安全着陆（成功或失败），直接告诉 AI 最终答案
+      if (result.status === "completed" || result.status === "failed") {
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(result, null, 2) },
+          ],
+          ...(result.status === "failed" ? { isError: true } : {}),
+        };
+      }
+
+      // 2. 如果状态是 "running"，引入时间触觉，防止子进程意外死掉导致 AI 傻等
+      if (result.status === "running") {
+        const fs = await import("node:fs");
+        const stats = fs.statSync(resultFile);
+        const minutesSinceLastUpdate = (Date.now() - stats.mtimeMs) / 1000 / 60;
+
+        // 如果这个状态文件超过 15 分钟没有任何数据写入（修改时间未变），说明子进程网络彻底锁死或被系统强杀了
+        if (minutesSinceLastUpdate > 15) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    status: "failed",
+                    error:
+                      "The upload background worker has frozen or crashed (no disk activity for 15 minutes).",
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+
+      // 3. 正常运行中，会原封不动返回带有 {"progress": "45%"} 的动态数据反馈给 AI
       return {
         content: [
           { type: "text" as const, text: JSON.stringify(result, null, 2) },
         ],
-        ...(result.status === "failed" ? { isError: true } : {}),
       };
     },
   );
 }
 
-// ── set_public: 保持原样 ──────────────────────────────────────────────
+// ── set_public: 修改视频隐私状态 ──────────────────────────────────────────
 
 export function registerSetPublic(server: McpServer): void {
   server.tool(
