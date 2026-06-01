@@ -4,7 +4,7 @@
 
 ## 它是什么
 
-YouTube Drama MCP 是一个 MCP Server，专门为中国短剧的 YouTube 分发场景设计。它将整个视频处理和上传流程封装为一组 MCP 工具，AI 助手（如 Claude、WorkBuddy 等）可以直接调用这些工具，自动完成从原始视频到 YouTube 发布的全流程。
+YouTube Drama MCP 是一个 MCP Server。它将整个视频处理和上传流程封装为一组 MCP 工具，AI 助手（如 Claude、WorkBuddy 等）可以直接调用这些工具，自动完成从原始视频到 YouTube 发布的全流程。
 
 **核心能力：**
 
