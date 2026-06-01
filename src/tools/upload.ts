@@ -313,3 +313,20 @@ export function registerCheckUploadStatus(server: McpServer): void {
 }
 
 // ── set_public: 修改视频隐私状态
+
+export function registerSetPublic(server: McpServer): void {
+  server.tool(
+    "set_public",
+    "Change a YouTube video from private to public",
+    {
+      videoId: z.string().describe("YouTube video ID"),
+      channelKey: z.string().describe("Channel key"),
+    },
+    async ({ videoId, channelKey }) => {
+      const result = await ytSetPublic(channelKey, videoId);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      };
+    }
+  );
+}
