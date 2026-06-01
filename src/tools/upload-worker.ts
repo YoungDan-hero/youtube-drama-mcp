@@ -8,7 +8,7 @@
  * The payload file contains JSON with OAuth tokens and is deleted after reading.
  */
 
-import { readFileSync, unlinkSync } from "node:fs";
+import { readFileSync, unlinkSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { google } from "googleapis";
@@ -66,6 +66,10 @@ async function main(): Promise<void> {
     } = payload;
     const { createReadStream, writeFileSync: ws } = await import("node:fs");
 
+    // Get file size upfront — gaxios onUploadProgress often omits totalBytes
+    // for resumable uploads with createReadStream, causing "Unknown" in progress.
+    const fileSize = statSync(videoPath).size;
+
     const auth = new google.auth.OAuth2(ch.clientId, ch.clientSecret);
     auth.setCredentials(tokens);
 
@@ -84,16 +88,14 @@ async function main(): Promise<void> {
       {
         onUploadProgress: (evt) => {
           try {
-            let progressStr = "0%";
-
-            if (evt.totalBytes && evt.totalBytes > 0) {
-              const progress = Math.round(
-                (evt.bytesRead / evt.totalBytes) * 100,
-              );
-              progressStr = `${progress}%`;
-            } else {
-              progressStr = `${(evt.bytesRead / 1024 / 1024).toFixed(1)} MB transmitted`;
-            }
+            // Prefer evt.totalBytes if available; fall back to fileSize from statSync
+            const totalBytes = evt.totalBytes && evt.totalBytes > 0
+              ? evt.totalBytes
+              : fileSize;
+            const progress = Math.round((evt.bytesRead / totalBytes) * 100);
+            const progressStr = `${progress}%`;
+            const totalMB = (totalBytes / 1024 / 1024).toFixed(1);
+            const readMB = (evt.bytesRead / 1024 / 1024).toFixed(1);
 
             ws(
               resultFile,
@@ -102,7 +104,7 @@ async function main(): Promise<void> {
                   ok: false,
                   status: "running",
                   progress: progressStr,
-                  message: `Uploading bytes: ${evt.bytesRead} / ${evt.totalBytes ?? "Unknown"}`,
+                  message: `Uploading: ${readMB} / ${totalMB} MB (${progress}%)`,
                 },
                 null,
                 2,

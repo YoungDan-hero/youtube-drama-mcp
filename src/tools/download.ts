@@ -17,12 +17,15 @@ function parseUrls(input: string): string[] {
 }
 
 function safeEncodeUrl(rawUrl: string): string {
-  // Try as-is first (already encoded URLs should work)
+  // Let WHATWG parser normalize the URL (auto-encodes non-ASCII, spaces, etc.)
+  // Return the normalized href instead of the raw input, because new URL()
+  // may succeed on URLs with unencoded characters (Chinese, spaces) that curl
+  // cannot handle — returning rawUrl would pass them through unencoded.
   try {
-    new URL(rawUrl);
-    return rawUrl;
+    const urlObj = new URL(rawUrl);
+    return urlObj.href;
   } catch {
-    // URL contains unencoded characters (Chinese, spaces, etc.) — encode it
+    // URL contains characters that even WHATWG parser rejects — use encodeURI
     return encodeURI(rawUrl);
   }
 }
