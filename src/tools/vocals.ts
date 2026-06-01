@@ -1,17 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { existsSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, writeFileSync, readFileSync, createWriteStream } from "node:fs";
 import { join, basename, extname } from "node:path";
 import { spawn } from "node:child_process";
 import { getContentDir, validateDramaId } from "../config.js";
 import { listVideoFiles, ensureDir } from "../utils/files.js";
-
-// ── Shell escaping to prevent injection ──────────────────────────────────────
-
-/** Escape a string for safe use inside a POSIX single-quoted shell argument. */
-function shellEscape(s: string): string {
-  return `'${s.replace(/'/g, "'\\''")}'`;
-}
 
 // ── Process health: check if a PID is still alive ────────────────────────────
 
@@ -22,6 +15,136 @@ function isPidAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+// ── Cross-platform background processor ───────────────────────────────────────
+// Replaces the previous bash shell script with pure Node.js spawn calls.
+// Works on macOS, Linux, and Windows without needing bash.
+
+function runBackgroundPipeline(opts: {
+  filePath: string;
+  name: string;
+  audioWav: string;
+  tmpDir: string;
+  processedPath: string;
+  audioDoneFile: string;
+  demucsDoneFile: string;
+  completedFile: string;
+  startedFile: string;
+  pidFile: string;
+  logFile: string;
+}): void {
+  const {
+    filePath,
+    name,
+    audioWav,
+    tmpDir,
+    processedPath,
+    audioDoneFile,
+    demucsDoneFile,
+    completedFile,
+    startedFile,
+    pidFile,
+    logFile,
+  } = opts;
+
+  // Write a "started" marker so check_vocals_status knows it's running
+  writeFileSync(startedFile, new Date().toISOString());
+
+  // Use a detached Node.js child process to run the pipeline
+  // This avoids bash dependency and works on Windows
+  const pipelineScript = `
+const { spawn, execFileSync } = require('child_process');
+const { existsSync, writeFileSync, readFileSync, readdirSync, statSync } = require('fs');
+const { join, basename } = require('path');
+const { createWriteStream } = require('fs');
+
+const logStream = createWriteStream(${JSON.stringify(logFile)}, { flags: 'a' });
+function log(msg) {
+  logStream.write(msg + '\\n');
+}
+
+function run(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    child.stdout.on('data', (d) => log(d.toString()));
+    child.stderr.on('data', (d) => { stderr += d.toString(); log(d.toString()); });
+    child.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error('Exit code ' + code + ': ' + stderr.slice(-500)));
+    });
+    child.on('error', reject);
+  });
+}
+
+async function main() {
+  try {
+    log('[bg] Starting pipeline for ${name}...');
+
+    // Step 1: Extract audio
+    log('[bg] Step 1/3: Extracting audio...');
+    await run('ffmpeg', ['-y', '-i', ${JSON.stringify(filePath)}, '-vn', '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', ${JSON.stringify(audioWav)}]);
+    writeFileSync(${JSON.stringify(audioDoneFile)}, new Date().toISOString());
+    log('[bg] Step 1/3: Audio extracted.');
+
+    // Step 2: Demucs vocal separation
+    log('[bg] Step 2/3: Running Demucs...');
+    await run('demucs', ['--two-stems=vocals', '-o', ${JSON.stringify(tmpDir)}, ${JSON.stringify(audioWav)}]);
+    writeFileSync(${JSON.stringify(demucsDoneFile)}, new Date().toISOString());
+    log('[bg] Step 2/3: Demucs done.');
+
+    // Step 3: Find vocals.wav and mux back into video
+    // Demucs creates: <tmpDir>/<model>/<audioName>/vocals.wav
+    log('[bg] Step 3/3: Muxing...');
+    let vocalsFile = '';
+    const audioName = basename(${JSON.stringify(audioWav)}, '.wav');
+    function findVocals(dir) {
+      const entries = readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          const found = findVocals(fullPath);
+          if (found) return found;
+        } else if (entry.name === 'vocals.wav') {
+          return fullPath;
+        }
+      }
+      return null;
+    }
+    const found = findVocals(${JSON.stringify(tmpDir)});
+    if (!found) {
+      log('[bg] ERROR: vocals.wav not found in demucs output');
+      process.exit(1);
+    }
+    vocalsFile = found;
+
+    await run('ffmpeg', ['-y', '-i', ${JSON.stringify(filePath)}, '-i', vocalsFile, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-map', '0:v:0', '-map', '1:a:0', ${JSON.stringify(processedPath)}]);
+
+    writeFileSync(${JSON.stringify(completedFile)}, new Date().toISOString());
+    log('[bg] Complete: ${name}');
+  } catch (err) {
+    log('[bg] FATAL: ' + err.message);
+    process.exit(1);
+  }
+}
+
+main();
+`;
+
+  // Spawn a detached Node.js process running the pipeline script
+  const child = spawn(process.execPath, ["-e", pipelineScript], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+
+  // Save PID for health monitoring (no deadline — let it run as long as needed)
+  if (child.pid) {
+    writeFileSync(pidFile, String(child.pid));
+  }
+
+  child.unref();
 }
 
 // ── separate_vocals: Fire-and-forget (truly immediate) ──────────────────────
@@ -70,55 +193,24 @@ export function registerSeparateVocals(server: McpServer): void {
         const audioWav = join(tmpDir, "audio.wav");
         const audioDoneFile = join(tmpDir, ".audio_extracted");
         const demucsDoneFile = join(tmpDir, ".demucs_done");
+        const startedFile = join(tmpDir, ".started");
+        const completedFile = join(tmpDir, ".completed");
+        const pidFile = join(tmpDir, ".pid");
         const logFile = join(tmpDir, "background.log");
 
-        // Write a "started" marker so check_vocals_status knows it's running
-        const startedFile = join(tmpDir, ".started");
-        writeFileSync(startedFile, new Date().toISOString());
-
-        // ── Background shell script ─────────────────────────────────────────
-        // Step markers (.audio_extracted, .demucs_done) allow diagnosing
-        // which step failed. Demucs output dir is discovered dynamically
-        // instead of hardcoding "htdemucs/audio".
-        const shell = [
-          `set -e`,
-          `echo "[bg] Starting pipeline for ${shellEscape(name)}..." > ${shellEscape(logFile)} 2>&1`,
-
-          // Step 1: Extract audio
-          `echo "[bg] Step 1/3: Extracting audio..." >> ${shellEscape(logFile)} 2>&1`,
-          `ffmpeg -y -i ${shellEscape(filePath)} -vn -acodec pcm_s16le -ar 44100 -ac 2 ${shellEscape(audioWav)} >> ${shellEscape(logFile)} 2>&1`,
-          `touch ${shellEscape(audioDoneFile)}`,
-          `echo "[bg] Step 1/3: Audio extracted." >> ${shellEscape(logFile)} 2>&1`,
-
-          // Step 2: Demucs vocal separation
-          `echo "[bg] Step 2/3: Running Demucs..." >> ${shellEscape(logFile)} 2>&1`,
-          `demucs --two-stems=vocals -o ${shellEscape(tmpDir)} ${shellEscape(audioWav)} >> ${shellEscape(logFile)} 2>&1`,
-          `touch ${shellEscape(demucsDoneFile)}`,
-          `echo "[bg] Step 2/3: Demucs done." >> ${shellEscape(logFile)} 2>&1`,
-
-          // Step 3: Mux vocals back into video
-          // Dynamically find the vocals.wav: demucs creates <outputDir>/<model>/<stemname>/vocals.wav
-          // where <stemname> is the audio filename without extension
-          `echo "[bg] Step 3/3: Muxing..." >> ${shellEscape(logFile)} 2>&1`,
-          `VOCALS_FILE=$(find ${shellEscape(tmpDir)} -name vocals.wav -print -quit 2>/dev/null)`,
-          `if [ -z "$VOCALS_FILE" ]; then`,
-          `  echo "[bg] ERROR: vocals.wav not found in demucs output" >> ${shellEscape(logFile)} 2>&1`,
-          `  exit 1`,
-          `fi`,
-          `ffmpeg -y -i ${shellEscape(filePath)} -i "$VOCALS_FILE" -c:v copy -c:a aac -b:a 192k -map 0:v:0 -map 1:a:0 ${shellEscape(processedPath)} >> ${shellEscape(logFile)} 2>&1`,
-          `date -u +"%Y-%m-%dT%H:%M:%S.${'%'}NZ" > ${shellEscape(join(tmpDir, ".completed"))}`,
-          `echo "[bg] Complete: ${shellEscape(name)}" >> ${shellEscape(logFile)} 2>&1`,
-        ].join("\n");
-
-        const child = spawn("bash", ["-c", shell], { detached: true, stdio: "ignore" });
-
-        // Save PID for health monitoring (no deadline — let it run as long as needed)
-        const pidFile = join(tmpDir, ".pid");
-        if (child.pid) {
-          writeFileSync(pidFile, String(child.pid));
-        }
-
-        child.unref();
+        runBackgroundPipeline({
+          filePath,
+          name,
+          audioWav,
+          tmpDir,
+          processedPath,
+          audioDoneFile,
+          demucsDoneFile,
+          completedFile,
+          startedFile,
+          pidFile,
+          logFile,
+        });
 
         results.push({ name, status: "started", processedPath });
       }

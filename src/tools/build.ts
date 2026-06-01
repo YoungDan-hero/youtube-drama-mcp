@@ -60,10 +60,15 @@ export function registerBuildVideo(server: McpServer): void {
       concatList.push(...normalizedFiles);
       if (outro && existsSync(outro)) concatList.push(outro);
 
+      // ffmpeg concat list requires forward-slash paths on all platforms
+      // (backslash is an escape char in the concat format on Windows)
       const listFile = join(outputDir, "concat_list.txt");
       writeFileSync(
         listFile,
-        concatList.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n"),
+        concatList.map((f) => {
+          const escaped = f.replace(/\\/g, "/").replace(/'/g, "'\\''");
+          return `file '${escaped}'`;
+        }).join("\n"),
         "utf-8"
       );
 

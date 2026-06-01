@@ -78,8 +78,8 @@ export function loadConfig(): AppConfig {
   for (const [key, ch] of Object.entries(parsed.channels)) {
     channels[key] = {
       channelId: ch.channel_id,
-      tokenFile: ch.token_file.replace(/^~(?=\/)/, homedir()),
-      clientSecret: ch.client_secret.replace(/^~(?=\/)/, homedir()),
+      tokenFile: ch.token_file.replace(/^~(?=[\/\\])/, homedir()),
+      clientSecret: ch.client_secret.replace(/^~(?=[\/\\])/, homedir()),
       dailyQuotaLimit: ch.daily_quota_limit,
     };
   }
