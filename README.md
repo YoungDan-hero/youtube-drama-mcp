@@ -65,7 +65,7 @@ npm run build
 
 **获取方法（任选一种）：**
 
-- 打开 YouTube Studio（https://studio.youtube.com），登录后浏览器地址栏会显示 `https://studio.youtube.com/channel/UCxxxxxxxxxxxxxxxx`，其中 `UC` 开头的就是频道 ID
+- 打开 YouTube（https://www.youtube.com/account_advanced），登录后，其中 `UC` 开头的就是频道 ID
 
 ### 2. 创建 GCP 项目并获取 OAuth 凭据文件（client_secret.json）
 
