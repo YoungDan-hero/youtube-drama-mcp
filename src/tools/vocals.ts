@@ -26,7 +26,8 @@ function isPidAlive(pid: number): boolean {
 
 // ── separate_vocals: Fire-and-forget (truly immediate) ──────────────────────
 
-const DEMUCS_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes per episode
+// No artificial timeout — processing time is unpredictable.
+// Health is determined solely by PID alive check + completion markers.
 
 export function registerSeparateVocals(server: McpServer): void {
   server.tool(
@@ -110,13 +111,11 @@ export function registerSeparateVocals(server: McpServer): void {
 
         const child = spawn("bash", ["-c", shell], { detached: true, stdio: "ignore" });
 
-        // Save PID and deadline for health monitoring
+        // Save PID for health monitoring (no deadline — let it run as long as needed)
         const pidFile = join(tmpDir, ".pid");
-        const deadlineFile = join(tmpDir, ".deadline");
         if (child.pid) {
           writeFileSync(pidFile, String(child.pid));
         }
-        writeFileSync(deadlineFile, String(Date.now() + DEMUCS_TIMEOUT_MS));
 
         child.unref();
 
@@ -149,7 +148,7 @@ export function registerSeparateVocals(server: McpServer): void {
 export function registerCheckVocalsStatus(server: McpServer): void {
   server.tool(
     "check_vocals_status",
-    "Poll vocal separation progress. Call repeatedly (every 30-60s) until allDone=true. Returns 'completed', 'running', 'pending', 'timed_out', or 'failed' per episode. Only proceed to build_video when allDone=true.",
+    "Poll vocal separation progress. Call repeatedly (every 30-60s) until allDone=true. Returns 'completed', 'running', 'pending', or 'failed' per episode. Only proceed to build_video when allDone=true.",
     {
       dramaId: z.string().describe("Drama ID"),
     },
@@ -173,7 +172,7 @@ export function registerCheckVocalsStatus(server: McpServer): void {
       const rawFiles = listVideoFiles(rawDir);
       const results: {
         name: string;
-        status: "completed" | "running" | "pending" | "failed" | "timed_out";
+        status: "completed" | "running" | "pending" | "failed";
         step?: string;
         processedPath?: string;
       }[] = [];
@@ -202,24 +201,9 @@ export function registerCheckVocalsStatus(server: McpServer): void {
           continue;
         }
 
-        // .started exists — check process health and timeout
+        // .started exists — check if process is still alive
         const pidFile = join(tmpDir, ".pid");
-        const deadlineFile = join(tmpDir, ".deadline");
 
-        // Check deadline
-        if (existsSync(deadlineFile)) {
-          try {
-            const deadline = parseInt(readFileSync(deadlineFile, "utf-8").trim(), 10);
-            if (Date.now() > deadline) {
-              results.push({ name, status: "timed_out", processedPath });
-              continue;
-            }
-          } catch {
-            // Corrupted deadline file — treat as still running
-          }
-        }
-
-        // Check if process is still alive
         let processAlive = false;
         if (existsSync(pidFile)) {
           try {
@@ -251,7 +235,6 @@ export function registerCheckVocalsStatus(server: McpServer): void {
 
       const allDone = results.every((r) => r.status === "completed");
       const anyRunning = results.some((r) => r.status === "running");
-      const anyTimedOut = results.some((r) => r.status === "timed_out");
       const anyFailed = results.some((r) => r.status === "failed");
 
       return {
@@ -263,17 +246,14 @@ export function registerCheckVocalsStatus(server: McpServer): void {
                 dramaId,
                 allDone,
                 anyRunning,
-                anyTimedOut,
                 anyFailed,
                 summary: allDone
                   ? "All episodes completed!"
-                  : anyTimedOut
-                    ? "Some episodes timed out. Check background.log and retry."
-                    : anyFailed
-                      ? "Some episodes failed. Check the 'step' field and background.log for errors."
-                      : anyRunning
-                        ? "Some episodes still processing..."
-                        : "No episodes currently running.",
+                  : anyFailed
+                    ? "Some episodes failed. Check the 'step' field and background.log for errors."
+                    : anyRunning
+                      ? "Some episodes still processing..."
+                      : "No episodes currently running.",
                 results,
               },
               null,

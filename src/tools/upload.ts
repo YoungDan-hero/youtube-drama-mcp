@@ -22,7 +22,8 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-const UPLOAD_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour for upload
+// No artificial timeout — upload time is unpredictable (depends on file size & network).
+// Health is determined solely by PID alive check + result file status.
 
 // ── upload_video: Fire-and-forget with temp file payload ──────────────────
 
@@ -155,12 +156,11 @@ export function registerUploadVideo(server: McpServer): void {
         stdio: "ignore",
       });
 
-      // Save PID and deadline for health monitoring
+      // Save PID for health monitoring (no deadline — let it run as long as needed)
       writeFileSync(
         metaFile,
         JSON.stringify({
           pid: child.pid,
-          deadline: Date.now() + UPLOAD_TIMEOUT_MS,
           resultFile,
         }),
         "utf-8",
@@ -197,7 +197,7 @@ export function registerUploadVideo(server: McpServer): void {
 export function registerCheckUploadStatus(server: McpServer): void {
   server.tool(
     "check_upload_status",
-    "Poll YouTube upload progress. Call repeatedly (every 30-60s) until status becomes 'completed'. Also detects timed-out or dead worker processes.",
+    "Poll YouTube upload progress. Call repeatedly (every 30-60s) until status becomes 'completed'. Also detects dead worker processes.",
     {
       resultFile: z
         .string()
@@ -240,27 +240,6 @@ export function registerCheckUploadStatus(server: McpServer): void {
       if (existsSync(metaFile)) {
         try {
           const meta = JSON.parse(readFileSync(metaFile, "utf-8"));
-
-          // Check deadline
-          if (meta.deadline && Date.now() > meta.deadline) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: JSON.stringify(
-                    {
-                      ...result,
-                      status: "timed_out",
-                      message: "Upload worker exceeded 1-hour deadline. The process may still be running but is considered stalled.",
-                    },
-                    null,
-                    2,
-                  ),
-                },
-              ],
-              isError: true,
-            };
-          }
 
           // Check if worker process is still alive
           if (meta.pid && !isPidAlive(meta.pid)) {
