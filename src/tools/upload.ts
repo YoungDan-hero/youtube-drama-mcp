@@ -30,12 +30,12 @@ function isPidAlive(pid: number): boolean {
 export function registerUploadVideo(server: McpServer): void {
   server.tool(
     "upload_video",
-    "Upload {dramaId}/output/{dramaId}-final.mp4 to YouTube. Starts upload in BACKGROUND — use check_upload_status to poll until complete. Only call AFTER build_video succeeds.",
+    "Upload {dramaId}/output/{dramaId}-final.mp4 to YouTube. Supports multi-channel upload — use comma-separated channelKey (e.g. 'video,shorts'). Starts upload(s) in BACKGROUND — use check_upload_status to poll until complete. Only call AFTER build_video succeeds.",
     {
       dramaId: z
         .string()
         .describe("Drama ID (same as used in download/separate/build)"),
-      channelKey: z.string().describe("Channel key from channels.yaml"),
+      channelKey: z.string().describe("Channel key(s) from channels.yaml. Single key or comma-separated for multi-channel upload (e.g. 'video,shorts')"),
       title: z.string().describe("Video title"),
       description: z.string().describe("Video description"),
       tags: z.string().describe("Comma-separated tags"),
@@ -75,102 +75,112 @@ export function registerUploadVideo(server: McpServer): void {
         };
       }
 
-      const timestamp = Date.now();
-      const resultFile = join(
-        homedir(),
-        ".youtube-drama-mcp",
-        `upload-result-${timestamp}.json`,
-      );
-      const metaFile = join(
-        homedir(),
-        ".youtube-drama-mcp",
-        `upload-meta-${timestamp}.json`,
-      );
+      const channelKeys = channelKey.split(",").map((k) => k.trim()).filter(Boolean);
 
-      const ch = getChannel(channelKey);
+      const uploads: { channelKey: string; resultFile: string; title: string; privacy: string }[] = [];
 
-      // Use verifyChannelId from client.ts (single source of truth for channel verification)
-      const verification = await verifyChannelId(channelKey);
-      if (!verification.ok) {
-        throw new Error(
-          `Channel ID mismatch: expected ${verification.expectedId}, got ${verification.actualId}`,
+      for (const ck of channelKeys) {
+        const timestamp = Date.now();
+        const resultFile = join(
+          homedir(),
+          ".youtube-drama-mcp",
+          `upload-result-${timestamp}.json`,
         );
+        const metaFile = join(
+          homedir(),
+          ".youtube-drama-mcp",
+          `upload-meta-${timestamp}.json`,
+        );
+
+        const ch = getChannel(ck);
+
+        // Use verifyChannelId from client.ts (single source of truth for channel verification)
+        const verification = await verifyChannelId(ck);
+        if (!verification.ok) {
+          throw new Error(
+            `Channel '${ck}' ID mismatch: expected ${verification.expectedId}, got ${verification.actualId}`,
+          );
+        }
+
+        const quotaCheck = checkQuotaAvailable(
+          ck,
+          "upload",
+          ch.dailyQuotaLimit,
+        );
+        if (!quotaCheck.ok) throw new Error(`Channel '${ck}': ${quotaCheck.message}`);
+
+        // Get OAuth client for worker payload — need client credentials for worker
+        const client = await ensureValidToken(ch.tokenFile, ch.clientSecret);
+        const clientSecret = await import("node:fs").then(fs =>
+          JSON.parse(fs.readFileSync(ch.clientSecret, "utf-8")).web
+        );
+
+        // Write initial status file
+        const startedAt = new Date().toISOString();
+        writeFileSync(
+          resultFile,
+          JSON.stringify(
+            {
+              ok: false,
+              status: "running",
+              progress: "0%",
+              message: "Spawning background upload worker...",
+              channelKey: ck,
+              startedAt,
+            },
+            null,
+            2,
+          ),
+          "utf-8",
+        );
+
+        const tagsArray = tags.split(",").map((t) => t.trim());
+
+        // Fork the isolated worker — not this file itself
+        const workerPath = join(fileURLToPath(import.meta.url), "..", "upload-worker.js");
+
+        const workerPayload = {
+          videoPath,
+          resultFile,
+          channelKey: ck,
+          title,
+          description,
+          tagsArray,
+          privacy,
+          ch: { channelId: ch.channelId, clientId: clientSecret.client_id, clientSecret: clientSecret.client_secret },
+          tokens: client.credentials,
+          startedAt,
+        };
+
+        // Write payload to temp file with restricted permissions (0600)
+        const payloadPath = join(
+          homedir(),
+          ".youtube-drama-mcp",
+          `upload-payload-${timestamp}.json`,
+        );
+        writeFileSync(payloadPath, JSON.stringify(workerPayload), { mode: 0o600 });
+
+        const child = fork(workerPath, [payloadPath], {
+          detached: true,
+          stdio: "ignore",
+        });
+
+        // Save PID for health monitoring (no deadline — let it run as long as needed)
+        writeFileSync(
+          metaFile,
+          JSON.stringify({
+            pid: child.pid,
+            resultFile,
+          }),
+          "utf-8",
+        );
+
+        child.unref();
+
+        uploads.push({ channelKey: ck, resultFile, title, privacy });
       }
 
-      const quotaCheck = checkQuotaAvailable(
-        channelKey,
-        "upload",
-        ch.dailyQuotaLimit,
-      );
-      if (!quotaCheck.ok) throw new Error(quotaCheck.message);
-
-      // Get OAuth client for worker payload — need client credentials for worker
-      const client = await ensureValidToken(ch.tokenFile, ch.clientSecret);
-      const clientSecret = await import("node:fs").then(fs =>
-        JSON.parse(fs.readFileSync(ch.clientSecret, "utf-8")).web
-      );
-
-      // Write initial status file
-      const startedAt = new Date().toISOString();
-      writeFileSync(
-        resultFile,
-        JSON.stringify(
-          {
-            ok: false,
-            status: "running",
-            progress: "0%",
-            message: "Spawning background upload worker...",
-            startedAt,
-          },
-          null,
-          2,
-        ),
-        "utf-8",
-      );
-
-      const tagsArray = tags.split(",").map((t) => t.trim());
-
-      // Fork the isolated worker — not this file itself
-      const workerPath = join(fileURLToPath(import.meta.url), "..", "upload-worker.js");
-
-      const workerPayload = {
-        videoPath,
-        resultFile,
-        channelKey,
-        title,
-        description,
-        tagsArray,
-        privacy,
-        ch: { channelId: ch.channelId, clientId: clientSecret.client_id, clientSecret: clientSecret.client_secret },
-        tokens: client.credentials,
-        startedAt,
-      };
-
-      // Write payload to temp file with restricted permissions (0600)
-      const payloadPath = join(
-        homedir(),
-        ".youtube-drama-mcp",
-        `upload-payload-${timestamp}.json`,
-      );
-      writeFileSync(payloadPath, JSON.stringify(workerPayload), { mode: 0o600 });
-
-      const child = fork(workerPath, [payloadPath], {
-        detached: true,
-        stdio: "ignore",
-      });
-
-      // Save PID for health monitoring (no deadline — let it run as long as needed)
-      writeFileSync(
-        metaFile,
-        JSON.stringify({
-          pid: child.pid,
-          resultFile,
-        }),
-        "utf-8",
-      );
-
-      child.unref();
-
+      const isBatch = uploads.length > 1;
       return {
         content: [
           {
@@ -178,12 +188,11 @@ export function registerUploadVideo(server: McpServer): void {
             text: JSON.stringify(
               {
                 ok: true,
-                message:
-                  "Upload task safely spawned into system background. Monitor progress via check_upload_status.",
-                resultFile,
-                channelKey,
-                title,
-                privacy,
+                message: isBatch
+                  ? `${uploads.length} uploads spawned into background. Use check_upload_status for each resultFile.`
+                  : "Upload task safely spawned into system background. Monitor progress via check_upload_status.",
+                uploads,
+                ...(isBatch ? {} : { resultFile: uploads[0].resultFile, channelKey: uploads[0].channelKey }),
               },
               null,
               2,
