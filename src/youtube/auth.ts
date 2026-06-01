@@ -126,13 +126,20 @@ export function saveToken(
   }
 
   const stored: StoredToken = {
-    access_token: creds.access_token!,
-    refresh_token: creds.refresh_token!,
+    access_token: creds.access_token ?? "",
+    refresh_token: creds.refresh_token ?? "",
     token_uri: "https://oauth2.googleapis.com/token",
     client_id: clientId,
     client_secret: clientSecret,
     scopes,
     expiry: new Date(creds.expiry_date ?? Date.now()).toISOString(),
   };
+
+  if (!stored.access_token || !stored.refresh_token) {
+    throw new Error(
+      "OAuth flow did not return access_token or refresh_token. The user may have denied authorization.",
+    );
+  }
+
   writeFileSync(tokenPath, JSON.stringify(stored, null, 2), "utf-8");
 }

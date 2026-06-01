@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { writeFileSync, existsSync } from "node:fs";
+import { writeFileSync, existsSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
 import { getContentDir, validateDramaId } from "../config.js";
 import {
@@ -71,6 +71,11 @@ export function registerBuildVideo(server: McpServer): void {
 
       const info = await ffprobe(finalPath);
 
+      let sizeMb = 0;
+      try {
+        sizeMb = +(statSync(finalPath).size / 1024 / 1024).toFixed(1);
+      } catch {}
+
       return {
         content: [
           {
@@ -80,7 +85,7 @@ export function registerBuildVideo(server: McpServer): void {
                 dramaId,
                 videoPath: finalPath,
                 durationSec: Math.round(info.duration),
-                sizeMb: +(info.width > 0 ? 0 : 0),
+                sizeMb,
                 clipCount: allFiles.length,
                 resolution: `${info.width}x${info.height}`,
               },

@@ -43,7 +43,7 @@ export async function uploadVideo(
     title: string;
     description: string;
     tags: string;
-    privacy: string;
+    privacy: "private" | "public" | "unlisted";
   }
 ): Promise<{
   videoId: string;
@@ -55,14 +55,19 @@ export async function uploadVideo(
   const check = checkQuotaAvailable(channelKey, "upload", ch.dailyQuotaLimit);
   if (!check.ok) throw new Error(check.message);
 
-  const verification = await verifyChannelId(channelKey);
-  if (!verification.ok) {
+  // Get client once — verifyChannelId already calls getYouTubeClient internally,
+  // so we do verification + client creation in a single pass
+  const { youtube } = await getYouTubeClient(channelKey);
+
+  // Verify channel in the same session
+  const verifyResp = await youtube.channels.list({ part: ["id"], mine: true });
+  const actualId = verifyResp.data.items?.[0]?.id ?? "";
+  if (actualId !== ch.channelId) {
     throw new Error(
-      `Channel ID mismatch: expected ${verification.expectedId}, got ${verification.actualId}`
+      `Channel ID mismatch: expected ${ch.channelId}, got ${actualId}`,
     );
   }
 
-  const { youtube } = await getYouTubeClient(channelKey);
   const start = Date.now();
 
   const fs = await import("node:fs");
@@ -79,13 +84,16 @@ export async function uploadVideo(
         tags: params.tags.split(",").map((t) => t.trim()),
       },
       status: {
-        privacyStatus: params.privacy as any,
+        privacyStatus: params.privacy,
       },
     },
     media,
   });
 
-  const videoId = resp.data.id!;
+  const videoId = resp.data.id;
+  if (!videoId) {
+    throw new Error("YouTube API did not return a video ID after upload.");
+  }
   const uploadSec = Math.round((Date.now() - start) / 1000);
   recordQuotaUsage(channelKey, "upload", 1600, videoId);
 
@@ -164,7 +172,10 @@ export async function pullAnalytics(
   }
 
   const channel = channelResp.data.items[0];
-  const channelId = channel.id!;
+  const channelId = channel.id;
+  if (!channelId) {
+    throw new Error("Channel ID not found in API response.");
+  }
 
   const dailyResp = await analytics.reports.query({
     ids: `channel==${channelId}`,

@@ -1,13 +1,13 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { existsSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { google } from "googleapis";
 import { getChannel, validateDramaId } from "../config.js";
 import { ensureValidToken } from "../youtube/auth.js";
-import { recordQuotaUsage, checkQuotaAvailable } from "../youtube/quota.js";
-import { setPublic as ytSetPublic } from "../youtube/client.js";
+import { checkQuotaAvailable } from "../youtube/quota.js";
+import { setPublic as ytSetPublic, verifyChannelId } from "../youtube/client.js";
 import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -23,111 +23,6 @@ function isPidAlive(pid: number): boolean {
 }
 
 const UPLOAD_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour for upload
-
-// ── 🌟 子进程执行分支（后台真正上传逻辑） ───────────────────────────────────
-if (process.argv[2] === "--worker-mode" && process.argv[3]) {
-  let payload: any;
-  try {
-    // Read payload from temp file (avoids exposing OAuth tokens in process list)
-    const payloadPath = process.argv[3];
-    payload = JSON.parse(readFileSync(payloadPath, "utf-8"));
-    // Immediately delete the payload file — it contains OAuth tokens
-    try { unlinkSync(payloadPath); } catch {}
-
-    const {
-      videoPath,
-      resultFile,
-      channelKey,
-      title,
-      description,
-      tagsArray,
-      privacy,
-      ch,
-      tokens,
-    } = payload;
-    const { createReadStream } = await import("node:fs");
-
-    const auth = new google.auth.OAuth2(ch.clientId, ch.clientSecret);
-    auth.setCredentials(tokens);
-
-    const youtube = google.youtube({ version: "v3", auth });
-
-    // Upload with progress tracking
-    const resp = await youtube.videos.insert(
-      {
-        part: ["snippet", "status"],
-        requestBody: {
-          snippet: { title, description, tags: tagsArray },
-          status: { privacyStatus: privacy },
-        },
-        media: { body: createReadStream(videoPath) },
-      },
-      {
-        onUploadProgress: (evt) => {
-          try {
-            let progressStr = "0%";
-
-            if (evt.totalBytes && evt.totalBytes > 0) {
-              const progress = Math.round(
-                (evt.bytesRead / evt.totalBytes) * 100,
-              );
-              progressStr = `${progress}%`;
-            } else {
-              progressStr = `${(evt.bytesRead / 1024 / 1024).toFixed(1)} MB transmitted`;
-            }
-
-            writeFileSync(
-              resultFile,
-              JSON.stringify(
-                {
-                  ok: false,
-                  status: "running",
-                  progress: progressStr,
-                  message: `Uploading bytes: ${evt.bytesRead} / ${evt.totalBytes ?? "Unknown"}`,
-                },
-                null,
-                2,
-              ),
-              "utf-8",
-            );
-          } catch (_) {}
-        },
-      },
-    );
-
-    const videoId = resp.data.id;
-    if (videoId) {
-      recordQuotaUsage(channelKey, "upload", 1600, videoId);
-    }
-
-    writeFileSync(
-      resultFile,
-      JSON.stringify(
-        { ok: true, status: "completed", videoId: videoId ?? "unknown", channelId: ch.channelId },
-        null,
-        2,
-      ),
-      "utf-8",
-    );
-    process.exit(0);
-  } catch (err: any) {
-    try {
-      const targetFile =
-        payload?.resultFile ||
-        join(homedir(), ".youtube-drama-mcp", `upload-error-fallback.json`);
-      writeFileSync(
-        targetFile,
-        JSON.stringify(
-          { ok: false, status: "failed", error: err.message ?? String(err) },
-          null,
-          2,
-        ),
-        "utf-8",
-      );
-    } catch (_) {}
-    process.exit(1);
-  }
-}
 
 // ── upload_video: Fire-and-forget with temp file payload ──────────────────
 
@@ -192,16 +87,13 @@ export function registerUploadVideo(server: McpServer): void {
       );
 
       const ch = getChannel(channelKey);
-      const client = await ensureValidToken(ch.tokenFile, ch.clientSecret);
-      const youtube = google.youtube({ version: "v3", auth: client });
 
-      const verifyResp = await youtube.channels.list({
-        part: ["id"],
-        mine: true,
-      });
-      const actualId = verifyResp.data.items?.[0]?.id ?? "";
-      if (actualId !== ch.channelId) {
-        throw new Error(`Channel ID mismatch: ${ch.channelId} vs ${actualId}`);
+      // Use verifyChannelId from client.ts (single source of truth for channel verification)
+      const verification = await verifyChannelId(channelKey);
+      if (!verification.ok) {
+        throw new Error(
+          `Channel ID mismatch: expected ${verification.expectedId}, got ${verification.actualId}`,
+        );
       }
 
       const quotaCheck = checkQuotaAvailable(
@@ -210,6 +102,12 @@ export function registerUploadVideo(server: McpServer): void {
         ch.dailyQuotaLimit,
       );
       if (!quotaCheck.ok) throw new Error(quotaCheck.message);
+
+      // Get OAuth client for worker payload — need client credentials for worker
+      const client = await ensureValidToken(ch.tokenFile, ch.clientSecret);
+      const clientSecret = await import("node:fs").then(fs =>
+        JSON.parse(fs.readFileSync(ch.clientSecret, "utf-8")).web
+      );
 
       // Write initial status file
       writeFileSync(
@@ -228,7 +126,9 @@ export function registerUploadVideo(server: McpServer): void {
       );
 
       const tagsArray = tags.split(",").map((t) => t.trim());
-      const currentFilePath = fileURLToPath(import.meta.url);
+
+      // Fork the isolated worker — not this file itself
+      const workerPath = join(fileURLToPath(import.meta.url), "..", "upload-worker.js");
 
       const workerPayload = {
         videoPath,
@@ -238,12 +138,11 @@ export function registerUploadVideo(server: McpServer): void {
         description,
         tagsArray,
         privacy,
-        ch: { channelId: ch.channelId, clientSecret: ch.clientSecret },
+        ch: { channelId: ch.channelId, clientId: clientSecret.client_id, clientSecret: clientSecret.client_secret },
         tokens: client.credentials,
       };
 
       // Write payload to temp file with restricted permissions (0600)
-      // instead of passing via command line where ps aux could expose tokens
       const payloadPath = join(
         homedir(),
         ".youtube-drama-mcp",
@@ -251,7 +150,7 @@ export function registerUploadVideo(server: McpServer): void {
       );
       writeFileSync(payloadPath, JSON.stringify(workerPayload), { mode: 0o600 });
 
-      const child = fork(currentFilePath, ["--worker-mode", payloadPath], {
+      const child = fork(workerPath, [payloadPath], {
         detached: true,
         stdio: "ignore",
       });
