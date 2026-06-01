@@ -1,13 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
 import { getContentDir, validateDramaId } from "../config.js";
 import { ensureDir } from "../utils/files.js";
-
-const execFileAsync = promisify(execFile);
+import { execFileAsync } from "../utils/process.js";
 
 function parseUrls(input: string): string[] {
   if (existsSync(input)) {
@@ -55,7 +52,7 @@ export function registerDownloadEpisodes(server: McpServer): void {
 
       const files: string[] = [];
       const skipped: string[] = [];
-      const failed: string[] = [];
+      const failed: { name: string; reason: string }[] = [];
 
       for (let i = 0; i < urlList.length; i++) {
         const rawUrl = urlList[i];
@@ -91,8 +88,9 @@ export function registerDownloadEpisodes(server: McpServer): void {
             encodedUrl,
           ]);
           files.push(attname);
-        } catch {
-          failed.push(attname);
+        } catch (err: any) {
+          const reason = err.stderr?.toString().trim() || err.message || "unknown error";
+          failed.push({ name: attname, reason });
         }
       }
 
@@ -101,7 +99,9 @@ export function registerDownloadEpisodes(server: McpServer): void {
         .reduce((sum, f) => {
           try {
             return sum + statSync(join(targetDir, f)).size;
-          } catch {
+          } catch (err: any) {
+            // File disappeared between download and stat — log but continue
+            console.error(`Warning: could not stat ${f}: ${err.message}`);
             return sum;
           }
         }, 0);

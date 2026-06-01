@@ -1,8 +1,5 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { existsSync } from "node:fs";
-
-const execFileAsync = promisify(execFile);
+import { execFileAsync } from "./process.js";
 
 export class FFmpegError extends Error {
   constructor(
@@ -33,7 +30,7 @@ export async function ffprobe(filePath: string): Promise<{
 
     const data = JSON.parse(stdout);
     const videoStream = data.streams?.find(
-      (s: any) => s.codec_type === "video"
+      (s: { codec_type?: string }) => s.codec_type === "video"
     );
 
     return {
@@ -42,8 +39,10 @@ export async function ffprobe(filePath: string): Promise<{
       height: videoStream?.height ?? 0,
       format: data.format?.format_name ?? "",
     };
-  } catch (err: any) {
-    throw new FFmpegError(`ffprobe failed: ${err.message}`, err.stderr ?? "");
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const stderr = (err as { stderr?: string })?.stderr ?? "";
+    throw new FFmpegError(`ffprobe failed: ${msg}`, stderr);
   }
 }
 
@@ -61,12 +60,15 @@ export async function ffmpegConcat(
       "-movflags", "+faststart",
       outputPath,
     ]);
-  } catch (err: any) {
-    throw new FFmpegError(`ffmpeg concat failed: ${err.message}`, err.stderr ?? "");
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const stderr = (err as { stderr?: string })?.stderr ?? "";
+    throw new FFmpegError(`ffmpeg concat failed: ${msg}`, stderr);
   }
 }
 
-export async function ffmpegNormalize(
+/** Remux (recontainer) a video file without re-encoding. Adds faststart for web playback. */
+export async function ffmpegRemux(
   inputPath: string,
   outputPath: string
 ): Promise<void> {
@@ -78,8 +80,10 @@ export async function ffmpegNormalize(
       "-movflags", "+faststart",
       outputPath,
     ]);
-  } catch (err: any) {
-    throw new FFmpegError(`ffmpeg normalize failed: ${err.message}`, err.stderr ?? "");
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const stderr = (err as { stderr?: string })?.stderr ?? "";
+    throw new FFmpegError(`ffmpeg remux failed: ${msg}`, stderr);
   }
 }
 
@@ -100,8 +104,10 @@ export async function ffmpegMuxAudioVideo(
       "-movflags", "+faststart",
       outputPath,
     ]);
-  } catch (err: any) {
-    throw new FFmpegError(`ffmpeg mux failed: ${err.message}`, err.stderr ?? "");
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const stderr = (err as { stderr?: string })?.stderr ?? "";
+    throw new FFmpegError(`ffmpeg mux failed: ${msg}`, stderr);
   }
 }
 
@@ -119,7 +125,9 @@ export async function ffmpegExtractAudio(
       "-ac", "2",
       outputPath,
     ]);
-  } catch (err: any) {
-    throw new FFmpegError(`ffmpeg extract audio failed: ${err.message}`, err.stderr ?? "");
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const stderr = (err as { stderr?: string })?.stderr ?? "";
+    throw new FFmpegError(`ffmpeg extract audio failed: ${msg}`, stderr);
   }
 }

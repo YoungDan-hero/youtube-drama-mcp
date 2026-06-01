@@ -36,7 +36,7 @@ async function main(): Promise<void> {
   try {
     payload = JSON.parse(readFileSync(payloadPath, "utf-8"));
     // Immediately delete the payload file — it contains OAuth tokens
-    try { unlinkSync(payloadPath); } catch {}
+    try { unlinkSync(payloadPath); } catch { /* payload already gone */ }
   } catch (err: any) {
     // Can't even read payload — write fallback error and exit
     try {
@@ -46,7 +46,9 @@ async function main(): Promise<void> {
         { ok: false, status: "failed", error: `Failed to read worker payload: ${err.message}` },
         null, 2,
       ), "utf-8");
-    } catch {}
+    } catch (fallbackErr: any) {
+      console.error(`[upload-worker] CRITICAL: Failed to write fallback error: ${fallbackErr.message}`);
+    }
     process.exit(1);
   }
 
@@ -107,7 +109,10 @@ async function main(): Promise<void> {
               ),
               "utf-8",
             );
-          } catch (_) {}
+          } catch (progressErr: any) {
+            // Progress write failed — log to stderr but don't crash the upload
+            console.error(`[upload-worker] Failed to write progress: ${progressErr.message}`);
+          }
         },
       },
     );
@@ -142,7 +147,10 @@ async function main(): Promise<void> {
         ),
         "utf-8",
       );
-    } catch {}
+    } catch (writeErr: any) {
+      console.error(`[upload-worker] CRITICAL: Failed to write error result: ${writeErr.message}`);
+      console.error(`[upload-worker] Original error was: ${err.message ?? String(err)}`);
+    }
     process.exit(1);
   }
 }

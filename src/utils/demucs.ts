@@ -1,9 +1,16 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+/**
+ * @deprecated DEAD CODE — DO NOT USE
+ *
+ * This module is NOT imported by any file in the project.
+ * The actual Demucs integration lives in tools/vocals.ts which uses
+ * a bash script approach for fire-and-forget background processing.
+ *
+ * This file should be deleted when convenient.
+ */
+
 import { existsSync } from "node:fs";
 import { join, basename } from "node:path";
-
-const execFileAsync = promisify(execFile);
+import { execFileAsync } from "./process.js";
 
 export class DemucsError extends Error {
   constructor(
@@ -15,6 +22,7 @@ export class DemucsError extends Error {
   }
 }
 
+/** @deprecated Not used — see tools/vocals.ts for the active implementation. */
 export async function separateVocals(
   inputPath: string,
   outputDir: string
@@ -33,7 +41,6 @@ export async function separateVocals(
         "-o", outputDir,
         inputPath,
       ],
-      { timeout: 300_000 }
     );
 
     const vocalsPath = join(outputDir, "htdemucs", name, "vocals.wav");
@@ -42,11 +49,12 @@ export async function separateVocals(
     }
 
     return { vocalsPath, success: true };
-  } catch (err: any) {
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
     return {
       vocalsPath: "",
       success: false,
-      error: `Demucs failed: ${err.message}`,
+      error: `Demucs failed: ${msg}`,
     };
   }
 }

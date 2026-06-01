@@ -5,7 +5,7 @@ import { join, basename } from "node:path";
 import { getContentDir, validateDramaId } from "../config.js";
 import {
   ffmpegConcat,
-  ffmpegNormalize,
+  ffmpegRemux,
   ffprobe,
 } from "../utils/ffmpeg.js";
 import { listVideoFiles, ensureDir } from "../utils/files.js";
@@ -49,7 +49,7 @@ export function registerBuildVideo(server: McpServer): void {
         const name = basename(file);
         const normPath = join(normalizedDir, name);
         if (!existsSync(normPath)) {
-          await ffmpegNormalize(file, normPath);
+          await ffmpegRemux(file, normPath);
         }
         normalizedFiles.push(normPath);
       }
@@ -62,7 +62,7 @@ export function registerBuildVideo(server: McpServer): void {
       const listFile = join(outputDir, "concat_list.txt");
       writeFileSync(
         listFile,
-        concatList.map((f) => `file '${f}'`).join("\n"),
+        concatList.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n"),
         "utf-8"
       );
 

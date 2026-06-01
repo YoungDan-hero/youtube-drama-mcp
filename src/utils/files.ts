@@ -1,13 +1,38 @@
-import { writeFileSync, renameSync, mkdirSync, existsSync, readdirSync, statSync } from "node:fs";
-import { join, extname } from "node:path";
+import { writeFileSync, renameSync, mkdirSync, existsSync, readdirSync, statSync, unlinkSync, openSync, closeSync, fsyncSync } from "node:fs";
+import { join, extname, dirname } from "node:path";
 
+/**
+ * Write JSON to a file atomically (write to .tmp → fsync → rename).
+ * On crash, at worst a stale .tmp file is left — the original file is never corrupted.
+ * Call `cleanupStaleTmp(filePath)` periodically if needed.
+ */
 export function atomicWriteJson(filePath: string, data: unknown): void {
-  const dir = join(filePath, "..");
+  const dir = dirname(filePath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
   const tmp = filePath + ".tmp";
+
+  // Write to temp file
   writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
+
+  // fsync to ensure data is on disk before rename
+  try {
+    const fd = openSync(tmp, "r");
+    fsyncSync(fd);
+    closeSync(fd);
+  } catch {
+    // fsync failed — rename will still likely work, just less durable
+  }
+
   renameSync(tmp, filePath);
+}
+
+/** Remove stale .tmp files left by crashed atomicWriteJson calls. */
+export function cleanupStaleTmp(filePath: string): void {
+  const tmp = filePath + ".tmp";
+  if (existsSync(tmp)) {
+    try { unlinkSync(tmp); } catch { /* already gone or permission denied */ }
+  }
 }
 
 export function listVideoFiles(dir: string): string[] {

@@ -4,7 +4,6 @@ import {
   existsSync,
   readFileSync,
   writeFileSync,
-  mkdirSync,
   readdirSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -13,6 +12,7 @@ import { createServer } from "node:http";
 import { exec } from "node:child_process";
 import { OAuth2Client } from "google-auth-library";
 import { createOAuthClient, saveToken } from "../youtube/auth.js";
+import { ensureDir } from "../utils/files.js";
 import { parse, stringify } from "yaml";
 
 // ── HTML templates ──────────────────────────────────────────────
@@ -108,9 +108,6 @@ const SCOPES = [
 ];
 
 // ── Helpers ──────────────────────────────────────────────────────
-function ensureDir(dir: string) {
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-}
 
 function tryOpenBrowser(url: string): boolean {
   try {
@@ -278,9 +275,9 @@ export function registerSetup(server: McpServer): void {
 
       // Always save channel config to channels.yaml — even if client_secret.json
       // isn't ready yet. The channel info is known, and the paths are predictable.
-      let existing: any = { channels: {} };
+      let existing: { channels: Record<string, unknown> } = { channels: {} };
       if (existsSync(CONFIG_PATH)) {
-        existing = parse(readFileSync(CONFIG_PATH, "utf-8"));
+        existing = parse(readFileSync(CONFIG_PATH, "utf-8")) as { channels: Record<string, unknown> };
       }
       existing.channels[channelKey] = {
         channel_id: channelId,

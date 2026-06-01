@@ -7,6 +7,35 @@ import {
   checkQuotaAvailable,
 } from "./quota.js";
 
+// ── Analytics return types ─────────────────────────────────────────────────────
+
+interface ChannelSummary {
+  id: string;
+  title: string | null | undefined;
+  statistics: youtube_v3.Schema$ChannelStatistics | undefined;
+}
+
+interface DailyStats {
+  date: string;
+  views: number;
+  estimatedRevenue: number;
+  estimatedAdRevenue: number;
+  likes: number;
+  comments: number;
+  subscribersGained: number;
+  subscribersLost: number;
+  averageViewDuration: number;
+}
+
+interface TopVideo {
+  videoId: string;
+  views: number;
+  revenue: number;
+  likes: number;
+  comments: number;
+  avgDuration: number;
+}
+
 export async function getYouTubeClient(channelKey: string): Promise<{
   youtube: youtube_v3.Youtube;
   client: OAuth2Client;
@@ -147,9 +176,9 @@ export async function pullAnalytics(
   channelKey: string,
   date?: string
 ): Promise<{
-  channel: any;
-  daily: any;
-  topVideos: any[];
+  channel: ChannelSummary;
+  daily: DailyStats | null;
+  topVideos: TopVideo[];
 }> {
   const ch = getChannel(channelKey);
   const { youtube, client } = await getYouTubeClient(channelKey);
@@ -196,14 +225,30 @@ export async function pullAnalytics(
     maxResults: 50,
   });
 
-  const topVideos = (videoResp.data.rows ?? []).map((row: any[]) => ({
-    videoId: row[0],
-    views: row[1],
-    revenue: row[2],
-    likes: row[3],
-    comments: row[4],
-    avgDuration: Math.round(row[5] ?? 0),
+  const topVideos = (videoResp.data.rows ?? []).map((row: (string | number)[]) => ({
+    videoId: String(row[0] ?? ""),
+    views: Number(row[1] ?? 0),
+    revenue: Number(row[2] ?? 0),
+    likes: Number(row[3] ?? 0),
+    comments: Number(row[4] ?? 0),
+    avgDuration: Math.round(Number(row[5] ?? 0)),
   }));
+
+  // Parse daily stats row
+  const dailyRow = dailyResp.data.rows?.[0];
+  const daily: DailyStats | null = dailyRow
+    ? {
+        date: String(dailyRow[0] ?? ""),
+        views: Number(dailyRow[1] ?? 0),
+        estimatedRevenue: Number(dailyRow[2] ?? 0),
+        estimatedAdRevenue: Number(dailyRow[3] ?? 0),
+        likes: Number(dailyRow[4] ?? 0),
+        comments: Number(dailyRow[5] ?? 0),
+        subscribersGained: Number(dailyRow[6] ?? 0),
+        subscribersLost: Number(dailyRow[7] ?? 0),
+        averageViewDuration: Number(dailyRow[8] ?? 0),
+      }
+    : null;
 
   return {
     channel: {
@@ -211,7 +256,7 @@ export async function pullAnalytics(
       title: channel.snippet?.title,
       statistics: channel.statistics,
     },
-    daily: dailyResp.data.rows?.[0] ?? null,
+    daily,
     topVideos,
   };
 }
