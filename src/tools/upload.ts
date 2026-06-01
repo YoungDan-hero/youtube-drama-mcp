@@ -111,6 +111,7 @@ export function registerUploadVideo(server: McpServer): void {
       );
 
       // Write initial status file
+      const startedAt = new Date().toISOString();
       writeFileSync(
         resultFile,
         JSON.stringify(
@@ -119,6 +120,7 @@ export function registerUploadVideo(server: McpServer): void {
             status: "running",
             progress: "0%",
             message: "Spawning background upload worker...",
+            startedAt,
           },
           null,
           2,
@@ -141,6 +143,7 @@ export function registerUploadVideo(server: McpServer): void {
         privacy,
         ch: { channelId: ch.channelId, clientId: clientSecret.client_id, clientSecret: clientSecret.client_secret },
         tokens: client.credentials,
+        startedAt,
       };
 
       // Write payload to temp file with restricted permissions (0600)

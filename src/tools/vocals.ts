@@ -106,6 +106,7 @@ export function registerSeparateVocals(server: McpServer): void {
           `  exit 1`,
           `fi`,
           `ffmpeg -y -i ${shellEscape(filePath)} -i "$VOCALS_FILE" -c:v copy -c:a aac -b:a 192k -map 0:v:0 -map 1:a:0 ${shellEscape(processedPath)} >> ${shellEscape(logFile)} 2>&1`,
+          `date -u +"%Y-%m-%dT%H:%M:%S.${'%'}NZ" > ${shellEscape(join(tmpDir, ".completed"))}`,
           `echo "[bg] Complete: ${shellEscape(name)}" >> ${shellEscape(logFile)} 2>&1`,
         ].join("\n");
 
@@ -175,6 +176,7 @@ export function registerCheckVocalsStatus(server: McpServer): void {
         status: "completed" | "running" | "pending" | "failed";
         step?: string;
         processedPath?: string;
+        timing?: { startedAt?: string; completedAt?: string; durationSec?: number };
       }[] = [];
 
       for (const filePath of rawFiles) {
@@ -184,15 +186,35 @@ export function registerCheckVocalsStatus(server: McpServer): void {
         const demucsDoneFile = join(tmpDir, ".demucs_done");
         const audioDoneFile = join(tmpDir, ".audio_extracted");
         const startedFile = join(tmpDir, ".started");
+        const completedFile = join(tmpDir, ".completed");
+
+        // Helper: read startedAt from .started file and compute duration
+        const getTiming = () => {
+          let startedAt: string | undefined;
+          let durationSec: number | undefined;
+          let completedAt: string | undefined;
+          try {
+            if (existsSync(startedFile)) {
+              startedAt = readFileSync(startedFile, "utf-8").trim();
+            }
+            if (existsSync(completedFile)) {
+              completedAt = readFileSync(completedFile, "utf-8").trim();
+            }
+            if (startedAt && completedAt) {
+              durationSec = +((new Date(completedAt).getTime() - new Date(startedAt).getTime()) / 1000).toFixed(1);
+            }
+          } catch { /* ignore read errors */ }
+          return startedAt || completedAt ? { startedAt, completedAt, durationSec } : undefined;
+        };
 
         if (existsSync(processedPath)) {
-          results.push({ name, status: "completed", processedPath });
+          results.push({ name, status: "completed", processedPath, timing: getTiming() });
           continue;
         }
 
         if (existsSync(demucsDoneFile)) {
           // .demucs_done exists but processed file doesn't → mux (step 3) failed
-          results.push({ name, status: "failed", step: "mux", processedPath });
+          results.push({ name, status: "failed", step: "mux", processedPath, timing: getTiming() });
           continue;
         }
 
@@ -220,17 +242,27 @@ export function registerCheckVocalsStatus(server: McpServer): void {
           const step = existsSync(audioDoneFile)
             ? "demucs"
             : "audio_extract";
-          results.push({ name, status: "failed", step, processedPath });
+          results.push({ name, status: "failed", step, processedPath, timing: getTiming() });
           continue;
         }
 
-        // Process still running — report current step
+        // Process still running — report current step and elapsed time
         const step = existsSync(demucsDoneFile)
           ? "mux"
           : existsSync(audioDoneFile)
             ? "demucs"
             : "audio_extract";
-        results.push({ name, status: "running", step });
+        const runningTiming = (() => {
+          try {
+            if (existsSync(startedFile)) {
+              const startedAt = readFileSync(startedFile, "utf-8").trim();
+              const elapsedSec = +((Date.now() - new Date(startedAt).getTime()) / 1000).toFixed(1);
+              return { startedAt, elapsedSec };
+            }
+          } catch { /* ignore */ }
+          return undefined;
+        })();
+        results.push({ name, status: "running", step, timing: runningTiming });
       }
 
       const allDone = results.every((r) => r.status === "completed");

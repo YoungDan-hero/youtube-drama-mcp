@@ -28,6 +28,7 @@ export function registerBuildVideo(server: McpServer): void {
     },
     async ({ dramaId, audioMode, intro, outro }) => {
       validateDramaId(dramaId);
+      const startedAt = new Date();
 
       const inputDir = join(getContentDir(dramaId), "processed");
       const outputDir = join(getContentDir(dramaId), "output");
@@ -76,6 +77,9 @@ export function registerBuildVideo(server: McpServer): void {
         sizeMb = +(statSync(finalPath).size / 1024 / 1024).toFixed(1);
       } catch {}
 
+      const completedAt = new Date();
+      const durationSec = +((completedAt.getTime() - startedAt.getTime()) / 1000).toFixed(1);
+
       return {
         content: [
           {
@@ -88,6 +92,11 @@ export function registerBuildVideo(server: McpServer): void {
                 sizeMb,
                 clipCount: allFiles.length,
                 resolution: `${info.width}x${info.height}`,
+                timing: {
+                  startedAt: startedAt.toISOString(),
+                  completedAt: completedAt.toISOString(),
+                  elapsedSec: durationSec,
+                },
               },
               null,
               2

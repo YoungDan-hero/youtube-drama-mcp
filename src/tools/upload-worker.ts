@@ -24,6 +24,7 @@ interface WorkerPayload {
   privacy: string;
   ch: { channelId: string; clientId: string; clientSecret: string };
   tokens: { access_token?: string; refresh_token?: string; expiry_date?: number };
+  startedAt?: string;
 }
 
 async function main(): Promise<void> {
@@ -124,10 +125,25 @@ async function main(): Promise<void> {
       recordQuotaUsage(channelKey, "upload", 1600, videoId);
     }
 
+    const completedAt = new Date().toISOString();
+    const durationSec = payload.startedAt
+      ? +((new Date(completedAt).getTime() - new Date(payload.startedAt).getTime()) / 1000).toFixed(1)
+      : undefined;
+
     ws(
       resultFile,
       JSON.stringify(
-        { ok: true, status: "completed", videoId: videoId ?? "unknown", channelId: ch.channelId },
+        {
+          ok: true,
+          status: "completed",
+          videoId: videoId ?? "unknown",
+          channelId: ch.channelId,
+          timing: {
+            startedAt: payload.startedAt,
+            completedAt,
+            durationSec,
+          },
+        },
         null,
         2,
       ),
