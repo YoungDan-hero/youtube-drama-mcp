@@ -1,25 +1,38 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { existsSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { google } from "googleapis";
-import { getChannel } from "../config.js";
+import { getChannel, validateDramaId } from "../config.js";
 import { ensureValidToken } from "../youtube/auth.js";
 import { recordQuotaUsage, checkQuotaAvailable } from "../youtube/quota.js";
 import { setPublic as ytSetPublic } from "../youtube/client.js";
 import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-// ── 🌟 子进程执行分支（后台真正上传逻辑，免疫双引号与百分比暴走） ───────────
+// ── Process health: check if a PID is still alive ────────────────────────────
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const UPLOAD_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour for upload
+
+// ── 🌟 子进程执行分支（后台真正上传逻辑） ───────────────────────────────────
 if (process.argv[2] === "--worker-mode" && process.argv[3]) {
   let payload: any;
   try {
-    // 1. Base64 安全解码参数
-    const decodedJson = Buffer.from(process.argv[3], "base64").toString(
-      "utf-8",
-    );
-    payload = JSON.parse(decodedJson);
+    // Read payload from temp file (avoids exposing OAuth tokens in process list)
+    const payloadPath = process.argv[3];
+    payload = JSON.parse(readFileSync(payloadPath, "utf-8"));
+    // Immediately delete the payload file — it contains OAuth tokens
+    try { unlinkSync(payloadPath); } catch {}
 
     const {
       videoPath,
@@ -39,7 +52,7 @@ if (process.argv[2] === "--worker-mode" && process.argv[3]) {
 
     const youtube = google.youtube({ version: "v3", auth });
 
-    // 2. 带有防爆计算的进度流上传
+    // Upload with progress tracking
     const resp = await youtube.videos.insert(
       {
         part: ["snippet", "status"],
@@ -54,14 +67,12 @@ if (process.argv[2] === "--worker-mode" && process.argv[3]) {
           try {
             let progressStr = "0%";
 
-            // 💡 健壮性修复：只有当总大小明确存在且大于 0 时才计算百分比
             if (evt.totalBytes && evt.totalBytes > 0) {
               const progress = Math.round(
                 (evt.bytesRead / evt.totalBytes) * 100,
               );
               progressStr = `${progress}%`;
             } else {
-              // 💡 优雅降级：若 totalBytes 为 undefined，则精细化显示已上传的兆字节 (MB)
               progressStr = `${(evt.bytesRead / 1024 / 1024).toFixed(1)} MB transmitted`;
             }
 
@@ -84,14 +95,15 @@ if (process.argv[2] === "--worker-mode" && process.argv[3]) {
       },
     );
 
-    const videoId = resp.data.id!;
-    recordQuotaUsage(channelKey, "upload", 1600, videoId);
+    const videoId = resp.data.id;
+    if (videoId) {
+      recordQuotaUsage(channelKey, "upload", 1600, videoId);
+    }
 
-    // ✅ 上传完美成功
     writeFileSync(
       resultFile,
       JSON.stringify(
-        { ok: true, status: "completed", videoId, channelId: ch.channelId },
+        { ok: true, status: "completed", videoId: videoId ?? "unknown", channelId: ch.channelId },
         null,
         2,
       ),
@@ -99,7 +111,6 @@ if (process.argv[2] === "--worker-mode" && process.argv[3]) {
     );
     process.exit(0);
   } catch (err: any) {
-    // ❌ 极力捕获异常写回本地
     try {
       const targetFile =
         payload?.resultFile ||
@@ -118,7 +129,7 @@ if (process.argv[2] === "--worker-mode" && process.argv[3]) {
   }
 }
 
-// ── upload_video: 唤醒并脱离 (Fork & Detach) ───────────────────────────
+// ── upload_video: Fire-and-forget with temp file payload ──────────────────
 
 export function registerUploadVideo(server: McpServer): void {
   server.tool(
@@ -138,6 +149,8 @@ export function registerUploadVideo(server: McpServer): void {
         .describe("Privacy status"),
     },
     async ({ dramaId, channelKey, title, description, tags, privacy }) => {
+      validateDramaId(dramaId);
+
       const videoPath = join(
         homedir(),
         ".youtube-drama-mcp",
@@ -172,6 +185,11 @@ export function registerUploadVideo(server: McpServer): void {
         ".youtube-drama-mcp",
         `upload-result-${timestamp}.json`,
       );
+      const metaFile = join(
+        homedir(),
+        ".youtube-drama-mcp",
+        `upload-meta-${timestamp}.json`,
+      );
 
       const ch = getChannel(channelKey);
       const client = await ensureValidToken(ch.tokenFile, ch.clientSecret);
@@ -193,7 +211,7 @@ export function registerUploadVideo(server: McpServer): void {
       );
       if (!quotaCheck.ok) throw new Error(quotaCheck.message);
 
-      // 先落地一个初始状态文件
+      // Write initial status file
       writeFileSync(
         resultFile,
         JSON.stringify(
@@ -224,15 +242,30 @@ export function registerUploadVideo(server: McpServer): void {
         tokens: client.credentials,
       };
 
-      // 对象转为坚固的 Base64 字符串
-      const base64Payload = Buffer.from(JSON.stringify(workerPayload)).toString(
-        "base64",
+      // Write payload to temp file with restricted permissions (0600)
+      // instead of passing via command line where ps aux could expose tokens
+      const payloadPath = join(
+        homedir(),
+        ".youtube-drama-mcp",
+        `upload-payload-${timestamp}.json`,
       );
+      writeFileSync(payloadPath, JSON.stringify(workerPayload), { mode: 0o600 });
 
-      const child = fork(currentFilePath, ["--worker-mode", base64Payload], {
+      const child = fork(currentFilePath, ["--worker-mode", payloadPath], {
         detached: true,
         stdio: "ignore",
       });
+
+      // Save PID and deadline for health monitoring
+      writeFileSync(
+        metaFile,
+        JSON.stringify({
+          pid: child.pid,
+          deadline: Date.now() + UPLOAD_TIMEOUT_MS,
+          resultFile,
+        }),
+        "utf-8",
+      );
 
       child.unref();
 
@@ -260,12 +293,12 @@ export function registerUploadVideo(server: McpServer): void {
   );
 }
 
-// ── check_upload_status: 智能状态与进度追踪工具 ────────────────────────────
+// ── check_upload_status: 状态与进度追踪 + 进程健康检查 ───────────────────────
 
 export function registerCheckUploadStatus(server: McpServer): void {
   server.tool(
     "check_upload_status",
-    "Poll YouTube upload progress. Call repeatedly (every 30-60s) until status becomes 'completed'.",
+    "Poll YouTube upload progress. Call repeatedly (every 30-60s) until status becomes 'completed'. Also detects timed-out or dead worker processes.",
     {
       resultFile: z
         .string()
@@ -293,7 +326,7 @@ export function registerCheckUploadStatus(server: McpServer): void {
 
       const result = JSON.parse(readFileSync(resultFile, "utf-8"));
 
-      // 💡 精简逻辑：如果子进程已经明确写回了结果（completed 或 failed），直接给 AI 最终答复
+      // If already completed or failed, return immediately
       if (result.status === "completed" || result.status === "failed") {
         return {
           content: [
@@ -301,6 +334,58 @@ export function registerCheckUploadStatus(server: McpServer): void {
           ],
           ...(result.status === "failed" ? { isError: true } : {}),
         };
+      }
+
+      // Still running — check process health via meta file
+      const metaFile = resultFile.replace("upload-result-", "upload-meta-");
+      if (existsSync(metaFile)) {
+        try {
+          const meta = JSON.parse(readFileSync(metaFile, "utf-8"));
+
+          // Check deadline
+          if (meta.deadline && Date.now() > meta.deadline) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    {
+                      ...result,
+                      status: "timed_out",
+                      message: "Upload worker exceeded 1-hour deadline. The process may still be running but is considered stalled.",
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+              isError: true,
+            };
+          }
+
+          // Check if worker process is still alive
+          if (meta.pid && !isPidAlive(meta.pid)) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    {
+                      ...result,
+                      status: "failed",
+                      error: "Upload worker process died unexpectedly. Check disk space and network connectivity.",
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+              isError: true,
+            };
+          }
+        } catch {
+          // Corrupted meta file — can't determine health, just return current result
+        }
       }
 
       return {

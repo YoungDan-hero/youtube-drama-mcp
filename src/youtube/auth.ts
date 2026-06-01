@@ -13,7 +13,19 @@ interface StoredToken {
 
 export function createOAuthClient(clientSecretPath: string): OAuth2Client {
   const raw = readFileSync(clientSecretPath, "utf-8");
-  const secret = JSON.parse(raw);
+  let secret: any;
+  try {
+    secret = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `Client secret file corrupted: ${clientSecretPath}. Re-download from GCP console.`,
+    );
+  }
+  if (!secret?.web?.client_id || !secret?.web?.client_secret) {
+    throw new Error(
+      `Invalid client secret format: ${clientSecretPath}. Expected { web: { client_id, client_secret } }.`,
+    );
+  }
   const { client_id, client_secret } = secret.web;
 
   return new OAuth2Client({
@@ -35,7 +47,19 @@ export function loadCredentials(
     );
   }
 
-  const stored: StoredToken = JSON.parse(readFileSync(tokenPath, "utf-8"));
+  let stored: StoredToken;
+  try {
+    stored = JSON.parse(readFileSync(tokenPath, "utf-8"));
+  } catch {
+    throw new Error(
+      `Token file corrupted: ${tokenPath}. Delete it and re-authorize via setup_authorize.`,
+    );
+  }
+  if (!stored.access_token || !stored.refresh_token) {
+    throw new Error(
+      `Token file incomplete: ${tokenPath}. Missing access_token or refresh_token. Re-authorize.`,
+    );
+  }
   client.setCredentials({
     access_token: stored.access_token,
     refresh_token: stored.refresh_token,
@@ -91,10 +115,14 @@ export function saveToken(
   let clientSecret = "";
 
   if (clientSecretPath && existsSync(clientSecretPath)) {
-    const raw = JSON.parse(readFileSync(clientSecretPath, "utf-8"));
-    const sec = raw.web;
-    clientId = sec.client_id ?? "";
-    clientSecret = sec.client_secret ?? "";
+    try {
+      const raw = JSON.parse(readFileSync(clientSecretPath, "utf-8"));
+      const sec = raw.web;
+      clientId = sec.client_id ?? "";
+      clientSecret = sec.client_secret ?? "";
+    } catch {
+      // Client secret file unreadable — leave clientId/clientSecret as empty strings
+    }
   }
 
   const stored: StoredToken = {

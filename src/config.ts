@@ -2,6 +2,22 @@ import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { parse } from "yaml";
+import { z } from "zod";
+
+// ── Zod schemas for YAML validation ──────────────────────────────────────────
+
+const ChannelYamlSchema = z.object({
+  channel_id: z.string(),
+  token_file: z.string(),
+  client_secret: z.string(),
+  daily_quota_limit: z.number().default(10000),
+});
+
+const ConfigYamlSchema = z.object({
+  channels: z.record(ChannelYamlSchema),
+});
+
+// ── Types ────────────────────────────────────────────────────────────────────
 
 export interface ChannelConfig {
   channelId: string;
@@ -32,6 +48,15 @@ export function getQuotaDir(): string {
   return join(DATA_DIR, "quota");
 }
 
+/** Validate dramaId to prevent path traversal and shell injection. */
+export function validateDramaId(dramaId: string): void {
+  if (!/^[a-zA-Z0-9_-]+$/.test(dramaId)) {
+    throw new Error(
+      `Invalid dramaId: "${dramaId}". Only alphanumeric, hyphen, and underscore characters are allowed.`,
+    );
+  }
+}
+
 export function loadConfig(): AppConfig {
   if (cached) return cached;
 
@@ -40,7 +65,14 @@ export function loadConfig(): AppConfig {
   }
 
   const raw = readFileSync(CONFIG_PATH, "utf-8");
-  const parsed = parse(raw) as { channels: Record<string, any> };
+  let parsed: z.infer<typeof ConfigYamlSchema>;
+  try {
+    parsed = ConfigYamlSchema.parse(parse(raw));
+  } catch (err: any) {
+    throw new Error(
+      `Invalid channels.yaml format: ${err.message}. Check that each channel has channel_id, token_file, client_secret fields.`,
+    );
+  }
 
   const channels: Record<string, ChannelConfig> = {};
   for (const [key, ch] of Object.entries(parsed.channels)) {
@@ -48,7 +80,7 @@ export function loadConfig(): AppConfig {
       channelId: ch.channel_id,
       tokenFile: ch.token_file.replace(/^~(?=\/)/, homedir()),
       clientSecret: ch.client_secret.replace(/^~(?=\/)/, homedir()),
-      dailyQuotaLimit: ch.daily_quota_limit ?? 10000,
+      dailyQuotaLimit: ch.daily_quota_limit,
     };
   }
 

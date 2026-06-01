@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { writeFileSync, existsSync } from "node:fs";
 import { join, basename } from "node:path";
-import { getContentDir } from "../config.js";
+import { getContentDir, validateDramaId } from "../config.js";
 import {
   ffmpegConcat,
   ffmpegNormalize,
@@ -27,6 +27,8 @@ export function registerBuildVideo(server: McpServer): void {
       outro: z.string().optional().describe("Outro video path"),
     },
     async ({ dramaId, audioMode, intro, outro }) => {
+      validateDramaId(dramaId);
+
       const inputDir = join(getContentDir(dramaId), "processed");
       const outputDir = join(getContentDir(dramaId), "output");
       ensureDir(outputDir);

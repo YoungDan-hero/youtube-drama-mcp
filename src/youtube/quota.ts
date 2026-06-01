@@ -44,8 +44,12 @@ export function loadQuota(channelKey: string): QuotaRecord {
   const today = todayPacific();
 
   if (existsSync(path)) {
-    const record: QuotaRecord = JSON.parse(readFileSync(path, "utf-8"));
-    if (record.date === today) return record;
+    try {
+      const record: QuotaRecord = JSON.parse(readFileSync(path, "utf-8"));
+      if (record.date === today && typeof record.used === "number") return record;
+    } catch {
+      // Quota file corrupted — reset to fresh daily record
+    }
   }
 
   return { date: today, used: 0, operations: [] };

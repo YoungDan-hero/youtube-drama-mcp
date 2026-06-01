@@ -4,7 +4,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
-import { getContentDir } from "../config.js";
+import { getContentDir, validateDramaId } from "../config.js";
 import { ensureDir } from "../utils/files.js";
 
 const execFileAsync = promisify(execFile);
@@ -41,6 +41,8 @@ export function registerDownloadEpisodes(server: McpServer): void {
       dramaId: z.string().describe("Drama ID, e.g. N193"),
     },
     async ({ urls, dramaId }) => {
+      validateDramaId(dramaId);
+
       const targetDir = join(getContentDir(dramaId), "raw");
       ensureDir(targetDir);
 

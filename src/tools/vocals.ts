@@ -1,12 +1,32 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync, readFileSync } from "node:fs";
 import { join, basename, extname } from "node:path";
 import { spawn } from "node:child_process";
-import { getContentDir } from "../config.js";
+import { getContentDir, validateDramaId } from "../config.js";
 import { listVideoFiles, ensureDir } from "../utils/files.js";
 
+// ── Shell escaping to prevent injection ──────────────────────────────────────
+
+/** Escape a string for safe use inside a POSIX single-quoted shell argument. */
+function shellEscape(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+// ── Process health: check if a PID is still alive ────────────────────────────
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0); // signal 0 = existence check, doesn't actually kill
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ── separate_vocals: Fire-and-forget (truly immediate) ──────────────────────
+
+const DEMUCS_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes per episode
 
 export function registerSeparateVocals(server: McpServer): void {
   server.tool(
@@ -18,6 +38,8 @@ export function registerSeparateVocals(server: McpServer): void {
       endEp: z.number().default(999).describe("End episode number"),
     },
     async ({ dramaId, startEp, endEp }) => {
+      validateDramaId(dramaId);
+
       const inputDir = join(getContentDir(dramaId), "raw");
       const outputDir = join(getContentDir(dramaId), "processed");
       ensureDir(outputDir);
@@ -54,24 +76,35 @@ export function registerSeparateVocals(server: McpServer): void {
         writeFileSync(startedFile, new Date().toISOString());
 
         // ── ALL heavy work (ffmpeg extract + demucs + mux) goes into background ──
+        // All paths are shell-escaped to prevent injection
         const shell = [
           `set -e`,
-          `echo "[bg] Starting pipeline for ${name}..." > "${logFile}" 2>&1`,
-          // Step 1: Extract audio (previously awaited — now in background)
-          `echo "[bg] Extracting audio..." >> "${logFile}" 2>&1`,
-          `ffmpeg -y -i "${filePath}" -vn -acodec pcm_s16le -ar 44100 -ac 2 "${audioWav}" >> "${logFile}" 2>&1`,
-          `echo "[bg] Audio extracted." >> "${logFile}" 2>&1`,
+          `echo "[bg] Starting pipeline for ${shellEscape(name)}..." > ${shellEscape(logFile)} 2>&1`,
+          // Step 1: Extract audio
+          `echo "[bg] Extracting audio..." >> ${shellEscape(logFile)} 2>&1`,
+          `ffmpeg -y -i ${shellEscape(filePath)} -vn -acodec pcm_s16le -ar 44100 -ac 2 ${shellEscape(audioWav)} >> ${shellEscape(logFile)} 2>&1`,
+          `echo "[bg] Audio extracted." >> ${shellEscape(logFile)} 2>&1`,
           // Step 2: Demucs vocal separation
-          `echo "[bg] Running Demucs..." >> "${logFile}" 2>&1`,
-          `demucs --two-stems=vocals -o "${tmpDir}" "${audioWav}" >> "${logFile}" 2>&1`,
-          `echo "[bg] Demucs done, muxing..." >> "${logFile}" 2>&1`,
+          `echo "[bg] Running Demucs..." >> ${shellEscape(logFile)} 2>&1`,
+          `demucs --two-stems=vocals -o ${shellEscape(tmpDir)} ${shellEscape(audioWav)} >> ${shellEscape(logFile)} 2>&1`,
+          `echo "[bg] Demucs done, muxing..." >> ${shellEscape(logFile)} 2>&1`,
           // Step 3: Mux vocals back into video
-          `ffmpeg -y -i "${filePath}" -i "${vocalsDir}/vocals.wav" -c:v copy -c:a aac -b:a 192k -map 0:v:0 -map 1:a:0 "${processedPath}" >> "${logFile}" 2>&1`,
-          `touch "${demucsDoneFile}"`,
-          `echo "[bg] Complete: ${name}" >> "${logFile}" 2>&1`,
+          `ffmpeg -y -i ${shellEscape(filePath)} -i ${shellEscape(vocalsDir + "/vocals.wav")} -c:v copy -c:a aac -b:a 192k -map 0:v:0 -map 1:a:0 ${shellEscape(processedPath)} >> ${shellEscape(logFile)} 2>&1`,
+          `touch ${shellEscape(demucsDoneFile)}`,
+          `echo "[bg] Complete: ${shellEscape(name)}" >> ${shellEscape(logFile)} 2>&1`,
         ].join("\n");
 
-        spawn("bash", ["-c", shell], { detached: true, stdio: "ignore" }).unref();
+        const child = spawn("bash", ["-c", shell], { detached: true, stdio: "ignore" });
+
+        // Save PID and deadline for health monitoring
+        const pidFile = join(tmpDir, ".pid");
+        const deadlineFile = join(tmpDir, ".deadline");
+        if (child.pid) {
+          writeFileSync(pidFile, String(child.pid));
+        }
+        writeFileSync(deadlineFile, String(Date.now() + DEMUCS_TIMEOUT_MS));
+
+        child.unref();
 
         results.push({ name, status: "started", processedPath });
       }
@@ -102,11 +135,13 @@ export function registerSeparateVocals(server: McpServer): void {
 export function registerCheckVocalsStatus(server: McpServer): void {
   server.tool(
     "check_vocals_status",
-    "Poll vocal separation progress. Call repeatedly (every 30-60s) until allDone=true. Returns 'completed', 'running', or 'pending' per episode. Only proceed to build_video when allDone=true.",
+    "Poll vocal separation progress. Call repeatedly (every 30-60s) until allDone=true. Returns 'completed', 'running', 'pending', or 'timed_out' per episode. Only proceed to build_video when allDone=true.",
     {
       dramaId: z.string().describe("Drama ID"),
     },
     async ({ dramaId }) => {
+      validateDramaId(dramaId);
+
       const outputDir = join(getContentDir(dramaId), "processed");
       const rawDir = join(getContentDir(dramaId), "raw");
 
@@ -124,7 +159,7 @@ export function registerCheckVocalsStatus(server: McpServer): void {
       const rawFiles = listVideoFiles(rawDir);
       const results: {
         name: string;
-        status: "completed" | "running" | "pending" | "failed";
+        status: "completed" | "running" | "pending" | "failed" | "timed_out";
         processedPath?: string;
       }[] = [];
 
@@ -134,23 +169,61 @@ export function registerCheckVocalsStatus(server: McpServer): void {
         const tmpDir = join(outputDir, "_tmp", name);
         const demucsDoneFile = join(tmpDir, ".demucs_done");
         const startedFile = join(tmpDir, ".started");
-        const audioWav = join(tmpDir, "audio.wav");
 
         if (existsSync(processedPath)) {
           results.push({ name, status: "completed", processedPath });
-        } else if (existsSync(demucsDoneFile)) {
+          continue;
+        }
+
+        if (existsSync(demucsDoneFile)) {
           // .demucs_done exists but processed file doesn't → mux may have failed
           results.push({ name, status: "failed", processedPath });
-        } else if (existsSync(startedFile)) {
-          // Background process was started (includes audio extraction phase)
-          results.push({ name, status: "running" });
-        } else {
-          results.push({ name, status: "pending" });
+          continue;
         }
+
+        if (!existsSync(startedFile)) {
+          results.push({ name, status: "pending" });
+          continue;
+        }
+
+        // .started exists — check process health and timeout
+        const pidFile = join(tmpDir, ".pid");
+        const deadlineFile = join(tmpDir, ".deadline");
+
+        // Check deadline
+        if (existsSync(deadlineFile)) {
+          try {
+            const deadline = parseInt(readFileSync(deadlineFile, "utf-8").trim(), 10);
+            if (Date.now() > deadline) {
+              results.push({ name, status: "timed_out", processedPath });
+              continue;
+            }
+          } catch {
+            // Corrupted deadline file — treat as still running
+          }
+        }
+
+        // Check if process is still alive
+        if (existsSync(pidFile)) {
+          try {
+            const pid = parseInt(readFileSync(pidFile, "utf-8").trim(), 10);
+            if (!isPidAlive(pid)) {
+              // Process died without completing → failed
+              results.push({ name, status: "failed", processedPath });
+              continue;
+            }
+          } catch {
+            // Corrupted PID file — can't determine, treat as running
+          }
+        }
+
+        results.push({ name, status: "running" });
       }
 
       const allDone = results.every((r) => r.status === "completed");
-      const anyRunning = results.some((r) => r.status === "running");
+      const anyRunning = results.some((r) => r.status === "running" || r.status === "timed_out");
+      const anyTimedOut = results.some((r) => r.status === "timed_out");
+      const anyFailed = results.some((r) => r.status === "failed");
 
       return {
         content: [
@@ -161,11 +234,17 @@ export function registerCheckVocalsStatus(server: McpServer): void {
                 dramaId,
                 allDone,
                 anyRunning,
+                anyTimedOut,
+                anyFailed,
                 summary: allDone
                   ? "All episodes completed!"
-                  : anyRunning
-                    ? "Some episodes still processing..."
-                    : "No episodes currently running.",
+                  : anyTimedOut
+                    ? "Some episodes timed out. Check background.log and retry."
+                    : anyFailed
+                      ? "Some episodes failed. Check background.log for errors."
+                      : anyRunning
+                        ? "Some episodes still processing..."
+                        : "No episodes currently running.",
                 results,
               },
               null,
