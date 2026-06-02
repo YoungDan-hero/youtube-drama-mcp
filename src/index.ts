@@ -9,6 +9,7 @@ import { registerSetThumbnail } from "./tools/thumbnail.js";
 import { registerPullAnalytics } from "./tools/analytics.js";
 import { registerGetQuotaStatus } from "./tools/quota.js";
 import { registerSetup } from "./tools/setup.js";
+import { registerCheckChannelVerification } from "./tools/channel.js";
 
 const server = new McpServer({
   name: "youtube-drama-mcp",
@@ -26,6 +27,7 @@ registerSetThumbnail(server);
 registerPullAnalytics(server);
 registerGetQuotaStatus(server);
 registerSetup(server);
+registerCheckChannelVerification(server);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

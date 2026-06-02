@@ -17,6 +17,97 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
+// ── Concurrency Manager ──────────────────────────────────────────────────────
+// Prevents launching too many Demucs processes simultaneously.
+// Default maxConcurrency = 2 (2 simultaneous demucs processes).
+
+interface PipelineOpts {
+  filePath: string;
+  name: string;
+  audioWav: string;
+  tmpDir: string;
+  processedPath: string;
+  audioDoneFile: string;
+  demucsDoneFile: string;
+  completedFile: string;
+  startedFile: string;
+  pidFile: string;
+  logFile: string;
+}
+
+interface QueuedJob {
+  opts: PipelineOpts;
+}
+
+const pendingQueue: QueuedJob[] = [];
+const runningJobs = new Map<string, { pidFile: string; processedPath: string }>();
+let maxConcurrency = 2;
+let schedulerTimer: ReturnType<typeof setInterval> | null = null;
+
+function isJobDone(name: string): boolean {
+  const info = runningJobs.get(name);
+  if (!info) return true;
+  // Completed if the processed file exists
+  if (existsSync(info.processedPath)) return true;
+  // Completed if the process is dead (success or failure)
+  if (!existsSync(info.pidFile)) return true;
+  try {
+    const pid = parseInt(readFileSync(info.pidFile, "utf-8").trim(), 10);
+    return !isPidAlive(pid);
+  } catch {
+    return true; // Can't read PID file → treat as done
+  }
+}
+
+function tickScheduler(): void {
+  // Remove completed jobs from running set
+  for (const name of runningJobs.keys()) {
+    if (isJobDone(name)) {
+      runningJobs.delete(name);
+    }
+  }
+
+  // Start queued jobs up to maxConcurrency
+  while (runningJobs.size < maxConcurrency && pendingQueue.length > 0) {
+    const job = pendingQueue.shift()!;
+    runBackgroundPipeline(job.opts);
+    runningJobs.set(job.opts.name, {
+      pidFile: job.opts.pidFile,
+      processedPath: job.opts.processedPath,
+    });
+  }
+
+  // If nothing left, stop the scheduler
+  if (runningJobs.size === 0 && pendingQueue.length === 0 && schedulerTimer) {
+    clearInterval(schedulerTimer);
+    schedulerTimer = null;
+  }
+}
+
+function startScheduler(): void {
+  if (schedulerTimer) return;
+  schedulerTimer = setInterval(tickScheduler, 10_000); // check every 10s
+  // Allow the Node.js process to exit naturally even if the timer is active
+  if (schedulerTimer && typeof schedulerTimer === "object" && "unref" in schedulerTimer) {
+    (schedulerTimer as ReturnType<typeof setInterval> & { unref(): void }).unref();
+  }
+}
+
+function enqueueJob(opts: PipelineOpts, startImmediately: boolean): "started" | "queued" {
+  if (startImmediately && runningJobs.size < maxConcurrency) {
+    runBackgroundPipeline(opts);
+    runningJobs.set(opts.name, {
+      pidFile: opts.pidFile,
+      processedPath: opts.processedPath,
+    });
+    startScheduler();
+    return "started";
+  }
+  pendingQueue.push({ opts });
+  startScheduler();
+  return "queued";
+}
+
 // ── Cross-platform background processor ───────────────────────────────────────
 // Replaces the previous bash shell script with pure Node.js spawn calls.
 // Works on macOS, Linux, and Windows without needing bash.
@@ -133,10 +224,12 @@ main();
 `;
 
   // Spawn a detached Node.js process running the pipeline script
+  // Inherit PATH so the child can find ffmpeg, demucs, etc.
   const child = spawn(process.execPath, ["-e", pipelineScript], {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
+    env: { ...process.env },
   });
 
   // Save PID for health monitoring (no deadline — let it run as long as needed)
@@ -155,14 +248,20 @@ main();
 export function registerSeparateVocals(server: McpServer): void {
   server.tool(
     "separate_vocals",
-    "Start Demucs vocal separation in the BACKGROUND, reading from {dramaId}/raw/. Returns immediately — use check_vocals_status to poll until allDone=true. After completion, call build_video with the same dramaId.",
+    "Start Demucs vocal separation in the BACKGROUND, reading from {dramaId}/raw/. Returns immediately — use check_vocals_status to poll until allDone=true. After completion, call build_video with the same dramaId. Uses concurrency control to avoid overloading CPU (default: 2 simultaneous processes, configurable via maxConcurrency).",
     {
       dramaId: z.string().describe("Drama ID (same as used in download_episodes)"),
       startEp: z.number().default(1).describe("Start episode number"),
       endEp: z.number().default(999).describe("End episode number"),
+      maxConcurrency: z.number().default(2).describe("Maximum number of simultaneous Demucs processes (default: 2). Increase on powerful machines, decrease if CPU is overloaded."),
     },
-    async ({ dramaId, startEp, endEp }) => {
+    async ({ dramaId, startEp, endEp, maxConcurrency: mc }) => {
       validateDramaId(dramaId);
+
+      // Update global maxConcurrency if specified
+      if (mc && mc >= 1) {
+        maxConcurrency = mc;
+      }
 
       const inputDir = join(getContentDir(dramaId), "raw");
       const outputDir = join(getContentDir(dramaId), "processed");
@@ -198,21 +297,24 @@ export function registerSeparateVocals(server: McpServer): void {
         const pidFile = join(tmpDir, ".pid");
         const logFile = join(tmpDir, "background.log");
 
-        runBackgroundPipeline({
-          filePath,
-          name,
-          audioWav,
-          tmpDir,
-          processedPath,
-          audioDoneFile,
-          demucsDoneFile,
-          completedFile,
-          startedFile,
-          pidFile,
-          logFile,
-        });
+        const jobStatus = enqueueJob(
+          {
+            filePath,
+            name,
+            audioWav,
+            tmpDir,
+            processedPath,
+            audioDoneFile,
+            demucsDoneFile,
+            completedFile,
+            startedFile,
+            pidFile,
+            logFile,
+          },
+          true // start immediately if slot available
+        );
 
-        results.push({ name, status: "started", processedPath });
+        results.push({ name, status: jobStatus, processedPath });
       }
 
       return {
@@ -223,7 +325,10 @@ export function registerSeparateVocals(server: McpServer): void {
               {
                 dramaId,
                 outputDir,
-                message: "Background processing started. Use check_vocals_status to monitor.",
+                maxConcurrency,
+                runningCount: runningJobs.size,
+                queuedCount: pendingQueue.length,
+                message: `Background processing started. ${runningJobs.size} running, ${pendingQueue.length} queued. Use check_vocals_status to monitor.`,
                 results,
               },
               null,
@@ -241,12 +346,15 @@ export function registerSeparateVocals(server: McpServer): void {
 export function registerCheckVocalsStatus(server: McpServer): void {
   server.tool(
     "check_vocals_status",
-    "Poll vocal separation progress. Call repeatedly (every 30-60s) until allDone=true. Returns 'completed', 'running', 'pending', or 'failed' per episode. Only proceed to build_video when allDone=true.",
+    "Poll vocal separation progress. Call repeatedly (every 30-60s) until allDone=true. Returns 'completed', 'running', 'pending', or 'failed' per episode. Only proceed to build_video when allDone=true. Also triggers the concurrency scheduler to start queued jobs when slots become available.",
     {
       dramaId: z.string().describe("Drama ID"),
     },
     async ({ dramaId }) => {
       validateDramaId(dramaId);
+
+      // Trigger scheduler to start queued jobs when slots are free
+      tickScheduler();
 
       const outputDir = join(getContentDir(dramaId), "processed");
       const rawDir = join(getContentDir(dramaId), "raw");

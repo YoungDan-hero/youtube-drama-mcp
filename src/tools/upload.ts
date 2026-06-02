@@ -3,13 +3,15 @@ import { z } from "zod";
 import { existsSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { google } from "googleapis";
-import { getChannel, validateDramaId } from "../config.js";
-import { ensureValidToken } from "../youtube/auth.js";
-import { checkQuotaAvailable } from "../youtube/quota.js";
-import { setPublic as ytSetPublic, verifyChannelId } from "../youtube/client.js";
+import { getChannel, validateDramaId, getContentDir } from "../config.js";
+import { setPublic as ytSetPublic } from "../youtube/client.js";
+import { checkLongUploadsStatus, getVerificationGuide } from "./channel.js";
+import { ffprobe } from "../utils/ffmpeg.js";
 import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
+
+// 15 minutes in seconds — YouTube's default max duration for unverified channels
+const UNVERIFIED_MAX_DURATION_SEC = 15 * 60;
 
 // ── Process health: check if a PID is still alive ────────────────────────────
 
@@ -75,6 +77,48 @@ export function registerUploadVideo(server: McpServer): void {
         };
       }
 
+      // ── 长视频验证检查：视频超过15分钟时，自动检查频道是否已验证 ──────
+      try {
+        const info = await ffprobe(videoPath);
+        const durationSec = Math.round(info.duration);
+        const durationMin = Math.round((durationSec / 60) * 10) / 10;
+
+        if (durationSec > UNVERIFIED_MAX_DURATION_SEC) {
+          // 视频超过15分钟，需要检查频道验证状态
+          const firstChannelKey = channelKey.split(",")[0].trim();
+          const verification = await checkLongUploadsStatus(firstChannelKey);
+
+          if (!verification.isVerified) {
+            const guide = getVerificationGuide(durationMin);
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    {
+                      ok: false,
+                      error: "Channel not verified for long uploads.",
+                      videoDuration: `${durationMin} minutes`,
+                      longUploadsStatus: verification.longUploadsStatus,
+                      verificationError: verification.error,
+                      guide,
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+              isError: true,
+            };
+          }
+        }
+      } catch (err: unknown) {
+        // ffprobe 失败时不阻塞上传，让 YouTube API 自行返回错误
+        const msg = err instanceof Error ? err.message : String(err);
+        // 仅记录日志，不中断流程
+        console.error(`[upload_video] ffprobe check failed (non-fatal): ${msg}`);
+      }
+
       const channelKeys = channelKey.split(",").map((k) => k.trim()).filter(Boolean);
 
       const uploads: { channelKey: string; resultFile: string; title: string; privacy: string }[] = [];
@@ -94,28 +138,7 @@ export function registerUploadVideo(server: McpServer): void {
 
         const ch = getChannel(ck);
 
-        // Use verifyChannelId from client.ts (single source of truth for channel verification)
-        const verification = await verifyChannelId(ck);
-        if (!verification.ok) {
-          throw new Error(
-            `Channel '${ck}' ID mismatch: expected ${verification.expectedId}, got ${verification.actualId}`,
-          );
-        }
-
-        const quotaCheck = checkQuotaAvailable(
-          ck,
-          "upload",
-          ch.dailyQuotaLimit,
-        );
-        if (!quotaCheck.ok) throw new Error(`Channel '${ck}': ${quotaCheck.message}`);
-
-        // Get OAuth client for worker payload — need client credentials for worker
-        const client = await ensureValidToken(ch.tokenFile, ch.clientSecret);
-        const clientSecret = await import("node:fs").then(fs =>
-          JSON.parse(fs.readFileSync(ch.clientSecret, "utf-8")).web
-        );
-
-        // Write initial status file
+        // Write initial status file immediately — the worker will verify & upload
         const startedAt = new Date().toISOString();
         writeFileSync(
           resultFile,
@@ -139,6 +162,7 @@ export function registerUploadVideo(server: McpServer): void {
         // Fork the isolated worker — not this file itself
         const workerPath = join(fileURLToPath(import.meta.url), "..", "upload-worker.js");
 
+        // Pass all needed config to the worker — it will handle verify + token + upload internally
         const workerPayload = {
           videoPath,
           resultFile,
@@ -147,8 +171,12 @@ export function registerUploadVideo(server: McpServer): void {
           description,
           tagsArray,
           privacy,
-          ch: { channelId: ch.channelId, clientId: clientSecret.client_id, clientSecret: clientSecret.client_secret },
-          tokens: client.credentials,
+          ch: {
+            channelId: ch.channelId,
+            tokenFile: ch.tokenFile,
+            clientSecret: ch.clientSecret,
+            dailyQuotaLimit: ch.dailyQuotaLimit,
+          },
           startedAt,
         };
 

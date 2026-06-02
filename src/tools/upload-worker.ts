@@ -13,6 +13,9 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { google } from "googleapis";
 import { recordQuotaUsage } from "../youtube/quota.js";
+import { ensureValidToken } from "../youtube/auth.js";
+import { checkQuotaAvailable } from "../youtube/quota.js";
+import { verifyChannelId } from "../youtube/client.js";
 
 interface WorkerPayload {
   videoPath: string;
@@ -22,8 +25,12 @@ interface WorkerPayload {
   description: string;
   tagsArray: string[];
   privacy: string;
-  ch: { channelId: string; clientId: string; clientSecret: string };
-  tokens: { access_token?: string; refresh_token?: string; expiry_date?: number };
+  ch: {
+    channelId: string;
+    tokenFile: string;
+    clientSecret: string;
+    dailyQuotaLimit: number;
+  };
   startedAt?: string;
 }
 
@@ -63,18 +70,45 @@ async function main(): Promise<void> {
       tagsArray,
       privacy,
       ch,
-      tokens,
     } = payload;
     const { createReadStream, writeFileSync: ws } = await import("node:fs");
+
+    // ── Step 1: Verify channel identity ────────────────────────────────
+    const verification = await verifyChannelId(channelKey);
+    if (!verification.ok) {
+      throw new Error(
+        `Channel '${channelKey}' ID mismatch: expected ${verification.expectedId}, got ${verification.actualId}`,
+      );
+    }
+
+    // ── Step 2: Check quota ─────────────────────────────────────────────
+    const quotaCheck = checkQuotaAvailable(channelKey, "upload", ch.dailyQuotaLimit);
+    if (!quotaCheck.ok) {
+      throw new Error(`Channel '${channelKey}': ${quotaCheck.message}`);
+    }
+
+    // ── Step 3: Get valid OAuth client ─────────────────────────────────
+    const client = await ensureValidToken(ch.tokenFile, ch.clientSecret);
+
+    // Update progress: preparing upload
+    ws(
+      resultFile,
+      JSON.stringify({
+        ok: false,
+        status: "running",
+        progress: "0%",
+        message: "Auth verified, starting upload...",
+        channelKey,
+        startedAt: payload.startedAt,
+      }, null, 2),
+      "utf-8",
+    );
 
     // Get file size upfront — gaxios onUploadProgress often omits totalBytes
     // for resumable uploads with createReadStream, causing "Unknown" in progress.
     const fileSize = statSync(videoPath).size;
 
-    const auth = new google.auth.OAuth2(ch.clientId, ch.clientSecret);
-    auth.setCredentials(tokens);
-
-    const youtube = google.youtube({ version: "v3", auth });
+    const youtube = google.youtube({ version: "v3", auth: client });
 
     // Upload with progress tracking
     const resp = await youtube.videos.insert(
