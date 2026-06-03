@@ -1,8 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { existsSync, writeFileSync, readFileSync, createWriteStream } from "node:fs";
+import { existsSync, writeFileSync, readFileSync } from "node:fs";
 import { join, basename, extname } from "node:path";
-import { spawn } from "node:child_process";
+import { fork } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { getContentDir, validateDramaId } from "../config.js";
 import { listVideoFiles, ensureDir } from "../utils/files.js";
 import { ensureDeps, getDemucsBin, getFfmpegBin, checkDeps } from "../utils/deps.js";
@@ -110,22 +111,10 @@ function enqueueJob(opts: PipelineOpts, startImmediately: boolean): "started" | 
 }
 
 // ── Cross-platform background processor ───────────────────────────────────────
-// Replaces the previous bash shell script with pure Node.js spawn calls.
+// Uses a dedicated worker file (vocals-worker.ts) spawned via fork().
 // Works on macOS, Linux, and Windows without needing bash.
 
-function runBackgroundPipeline(opts: {
-  filePath: string;
-  name: string;
-  audioWav: string;
-  tmpDir: string;
-  processedPath: string;
-  audioDoneFile: string;
-  demucsDoneFile: string;
-  completedFile: string;
-  startedFile: string;
-  pidFile: string;
-  logFile: string;
-}): void {
+function runBackgroundPipeline(opts: PipelineOpts): void {
   const {
     filePath,
     name,
@@ -147,94 +136,34 @@ function runBackgroundPipeline(opts: {
   // Write a "started" marker so check_vocals_status knows it's running
   writeFileSync(startedFile, new Date().toISOString());
 
-  // Use a detached Node.js child process to run the pipeline
-  // This avoids bash dependency and works on Windows
-  const pipelineScript = `
-const { spawn, execFileSync } = require('child_process');
-const { existsSync, writeFileSync, readFileSync, readdirSync, statSync } = require('fs');
-const { join, basename } = require('path');
-const { createWriteStream } = require('fs');
+  // Write payload to temp file for the worker
+  const payloadPath = join(tmpDir, "worker-payload.json");
+  writeFileSync(
+    payloadPath,
+    JSON.stringify({
+      ffmpegBin,
+      demucsBin,
+      filePath,
+      name,
+      audioWav,
+      tmpDir,
+      processedPath,
+      audioDoneFile,
+      demucsDoneFile,
+      completedFile,
+      logFile,
+    }),
+  );
 
-const logStream = createWriteStream(${JSON.stringify(logFile)}, { flags: 'a' });
-function log(msg) {
-  logStream.write(msg + '\\n');
-}
-
-function run(cmd, args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stderr = '';
-    child.stdout.on('data', (d) => log(d.toString()));
-    child.stderr.on('data', (d) => { stderr += d.toString(); log(d.toString()); });
-    child.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error('Exit code ' + code + ': ' + stderr.slice(-500)));
-    });
-    child.on('error', reject);
-  });
-}
-
-async function main() {
-  try {
-    log('[bg] Starting pipeline for ${name}...');
-
-    // Step 1: Extract audio
-    log('[bg] Step 1/3: Extracting audio...');
-    await run(${JSON.stringify(ffmpegBin)}, ['-y', '-i', ${JSON.stringify(filePath)}, '-vn', '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', ${JSON.stringify(audioWav)}]);
-    writeFileSync(${JSON.stringify(audioDoneFile)}, new Date().toISOString());
-    log('[bg] Step 1/3: Audio extracted.');
-
-    // Step 2: Demucs vocal separation
-    log('[bg] Step 2/3: Running Demucs...');
-    await run(${JSON.stringify(demucsBin)}, ['--two-stems=vocals', '-o', ${JSON.stringify(tmpDir)}, ${JSON.stringify(audioWav)}]);
-    writeFileSync(${JSON.stringify(demucsDoneFile)}, new Date().toISOString());
-    log('[bg] Step 2/3: Demucs done.');
-
-    // Step 3: Find vocals.wav and mux back into video
-    // Demucs creates: <tmpDir>/<model>/<audioName>/vocals.wav
-    log('[bg] Step 3/3: Muxing...');
-    let vocalsFile = '';
-    const audioName = basename(${JSON.stringify(audioWav)}, '.wav');
-    function findVocals(dir) {
-      const entries = readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const fullPath = join(dir, entry.name);
-        if (entry.isDirectory()) {
-          const found = findVocals(fullPath);
-          if (found) return found;
-        } else if (entry.name === 'vocals.wav') {
-          return fullPath;
-        }
-      }
-      return null;
-    }
-    const found = findVocals(${JSON.stringify(tmpDir)});
-    if (!found) {
-      log('[bg] ERROR: vocals.wav not found in demucs output');
-      process.exit(1);
-    }
-    vocalsFile = found;
-
-    await run(${JSON.stringify(ffmpegBin)}, ['-y', '-i', ${JSON.stringify(filePath)}, '-i', vocalsFile, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-map', '0:v:0', '-map', '1:a:0', ${JSON.stringify(processedPath)}]);
-
-    writeFileSync(${JSON.stringify(completedFile)}, new Date().toISOString());
-    log('[bg] Complete: ${name}');
-  } catch (err) {
-    log('[bg] FATAL: ' + err.message);
-    process.exit(1);
-  }
-}
-
-main();
-`;
-
-  // Spawn a detached Node.js process running the pipeline script
-  // Inherit PATH so the child can find ffmpeg, demucs, etc.
-  const child = spawn(process.execPath, ["-e", pipelineScript], {
+  // Fork the worker process — it reads payload, runs the pipeline, writes markers
+  const workerPath = join(
+    fileURLToPath(import.meta.url),
+    "..",
+    "vocals-worker.js",
+  );
+  const child = fork(workerPath, [payloadPath], {
     detached: true,
     stdio: "ignore",
-    windowsHide: true,
-    env: { ...process.env },
   });
 
   // Save PID for health monitoring (no deadline — let it run as long as needed)
