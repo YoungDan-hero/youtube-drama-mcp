@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { getQuotaDir } from "../config.js";
 import { atomicWriteJson } from "../utils/files.js";
