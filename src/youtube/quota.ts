@@ -17,10 +17,6 @@ const QUOTA_COSTS: Record<string, number> = {
   upload: 1600,
   thumbnail: 50,
   set_public: 50,
-  search: 100,
-  videos_list: 1,
-  channels_list: 1,
-  analytics_query: 1,
 };
 
 export function getQuotaCost(op: string): number {

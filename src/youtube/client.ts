@@ -46,6 +46,7 @@ export async function getYouTubeClient(channelKey: string): Promise<{
   return { youtube, client };
 }
 
+// Quota note: channels.list (1 unit). Not tracked — read-only, low cost, no side-effects on 429.
 export async function verifyChannelId(
   channelKey: string
 ): Promise<{ ok: boolean; actualId: string; expectedId: string }> {
@@ -172,6 +173,8 @@ export async function setPublic(
   return { status: "ok", privacy: "public", quotaUsed: 50 };
 }
 
+// Quota note: channels.list (1) + analytics.reports.query ×2 (2) = 3 units total.
+// Not tracked — read-only, low cost, no side-effects on 429.
 export async function pullAnalytics(
   channelKey: string,
   date?: string
