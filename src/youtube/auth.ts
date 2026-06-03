@@ -1,5 +1,6 @@
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { OAuth2Client } from "google-auth-library";
+import { atomicWriteJson } from "../utils/files.js";
 
 interface StoredToken {
   access_token: string;
@@ -78,7 +79,7 @@ export function loadCredentials(
         ? new Date(tokens.expiry_date).toISOString()
         : new Date().toISOString(),
     };
-    writeFileSync(tokenPath, JSON.stringify(updated, null, 2), "utf-8");
+    atomicWriteJson(tokenPath, updated);
   });
 
   return client;
@@ -141,5 +142,5 @@ export function saveToken(
     );
   }
 
-  writeFileSync(tokenPath, JSON.stringify(stored, null, 2), "utf-8");
+  atomicWriteJson(tokenPath, stored);
 }

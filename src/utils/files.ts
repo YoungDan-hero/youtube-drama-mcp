@@ -5,6 +5,9 @@ import { join, extname, dirname } from "node:path";
  * Write JSON to a file atomically (write to .tmp → fsync → rename).
  * On crash, at worst a stale .tmp file is left — the original file is never corrupted.
  * Call `cleanupStaleTmp(filePath)` periodically if needed.
+ *
+ * Windows note: renameSync over an existing target may throw EPERM if the file
+ * is open by another process. We retry with unlink-then-rename as a fallback.
  */
 export function atomicWriteJson(filePath: string, data: unknown): void {
   const dir = dirname(filePath);
@@ -24,7 +27,19 @@ export function atomicWriteJson(filePath: string, data: unknown): void {
     // fsync failed — rename will still likely work, just less durable
   }
 
-  renameSync(tmp, filePath);
+  try {
+    renameSync(tmp, filePath);
+  } catch (err: any) {
+    // Windows: renameSync over existing file may fail with EPERM/EPERM or EACCES.
+    // Fallback: remove target first, then rename. Not atomic on Windows, but the
+    // .tmp file still holds complete data for manual recovery.
+    if (err && (err.code === "EPERM" || err.code === "EACCES")) {
+      if (existsSync(filePath)) unlinkSync(filePath);
+      renameSync(tmp, filePath);
+    } else {
+      throw err;
+    }
+  }
 }
 
 /** Remove stale .tmp files left by crashed atomicWriteJson calls. */

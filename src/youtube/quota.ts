@@ -1,6 +1,7 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { getQuotaDir } from "../config.js";
+import { atomicWriteJson } from "../utils/files.js";
 
 interface QuotaRecord {
   date: string;
@@ -52,9 +53,7 @@ export function loadQuota(channelKey: string): QuotaRecord {
 }
 
 export function saveQuota(channelKey: string, record: QuotaRecord): void {
-  const dir = getQuotaDir();
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(getQuotaPath(channelKey), JSON.stringify(record, null, 2), "utf-8");
+  atomicWriteJson(getQuotaPath(channelKey), record);
 }
 
 export function recordQuotaUsage(
