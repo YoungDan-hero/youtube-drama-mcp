@@ -19,14 +19,10 @@ export function registerBuildVideo(server: McpServer): void {
       title: z.string().describe("Video title"),
       description: z.string().describe("Video description"),
       tags: z.string().describe("Comma-separated tags"),
-      audioMode: z
-        .enum(["demucs", "raw"])
-        .default("demucs")
-        .describe("Use demucs-separated or raw audio"),
       intro: z.string().optional().describe("Intro video path"),
       outro: z.string().optional().describe("Outro video path"),
     },
-    async ({ dramaId, audioMode, intro, outro }) => {
+    async ({ dramaId, intro, outro }) => {
       validateDramaId(dramaId);
       const startedAt = new Date();
 
