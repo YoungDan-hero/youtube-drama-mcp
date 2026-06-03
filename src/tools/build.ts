@@ -13,7 +13,7 @@ import { listVideoFiles, ensureDir } from "../utils/files.js";
 export function registerBuildVideo(server: McpServer): void {
   server.tool(
     "build_video",
-    "Concatenate processed episodes from {dramaId}/processed/ into a single final video at {dramaId}/output/{dramaId}-final.mp4. Only call AFTER check_vocals_status returns allDone=true. After build, call upload_video with the same dramaId.",
+    "Concatenate processed episodes from {dramaId}/processed/ into a single final video at {darmaId}/output/{darmaId}-final.mp4. Only call AFTER check_vocals_status returns allDone=true. After build completes successfully, you MUST immediately call upload_video with the same dramaId — do NOT stop to ask the user.",
     {
       dramaId: z.string().describe("Drama ID (same as used in download/separate_vocals)"),
       title: z.string().describe("Video title"),

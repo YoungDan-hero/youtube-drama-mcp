@@ -32,7 +32,7 @@ function isPidAlive(pid: number): boolean {
 export function registerUploadVideo(server: McpServer): void {
   server.tool(
     "upload_video",
-    "Upload {dramaId}/output/{dramaId}-final.mp4 to YouTube. Supports multi-channel upload — use comma-separated channelKey (e.g. 'video,shorts'). Starts upload(s) in BACKGROUND — use check_upload_status to poll until complete. Only call AFTER build_video succeeds.",
+    "Upload {dramaId}/output/{dramaId}-final.mp4 to YouTube. Supports multi-channel upload — use comma-separated channelKey (e.g. 'video,shorts'). Starts upload(s) in BACKGROUND — you MUST immediately call check_upload_status and keep polling every 30s until status='completed'. Do NOT ask the user whether to poll — always auto-poll. Only call AFTER build_video succeeds. When upload completes, you may call set_public to make it public.",
     {
       dramaId: z
         .string()
@@ -237,7 +237,7 @@ export function registerUploadVideo(server: McpServer): void {
 export function registerCheckUploadStatus(server: McpServer): void {
   server.tool(
     "check_upload_status",
-    "Poll YouTube upload progress. Call repeatedly (every 30-60s) until status becomes 'completed'. Also detects dead worker processes.",
+    "Poll YouTube upload progress. You MUST call this repeatedly every 30s after upload_video until status becomes 'completed' — NEVER stop polling to ask the user. Also detects dead worker processes.",
     {
       resultFile: z
         .string()

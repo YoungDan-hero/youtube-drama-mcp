@@ -5,6 +5,7 @@ import { join, basename, extname } from "node:path";
 import { spawn } from "node:child_process";
 import { getContentDir, validateDramaId } from "../config.js";
 import { listVideoFiles, ensureDir } from "../utils/files.js";
+import { ensureDeps, getDemucsBin, getFfmpegBin, checkDeps } from "../utils/deps.js";
 
 // ── Process health: check if a PID is still alive ────────────────────────────
 
@@ -139,6 +140,10 @@ function runBackgroundPipeline(opts: {
     logFile,
   } = opts;
 
+  // Resolve absolute paths for ffmpeg and demucs BEFORE spawning the child process
+  const ffmpegBin = getFfmpegBin();
+  const demucsBin = getDemucsBin();
+
   // Write a "started" marker so check_vocals_status knows it's running
   writeFileSync(startedFile, new Date().toISOString());
 
@@ -175,13 +180,13 @@ async function main() {
 
     // Step 1: Extract audio
     log('[bg] Step 1/3: Extracting audio...');
-    await run('ffmpeg', ['-y', '-i', ${JSON.stringify(filePath)}, '-vn', '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', ${JSON.stringify(audioWav)}]);
+    await run(${JSON.stringify(ffmpegBin)}, ['-y', '-i', ${JSON.stringify(filePath)}, '-vn', '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', ${JSON.stringify(audioWav)}]);
     writeFileSync(${JSON.stringify(audioDoneFile)}, new Date().toISOString());
     log('[bg] Step 1/3: Audio extracted.');
 
     // Step 2: Demucs vocal separation
     log('[bg] Step 2/3: Running Demucs...');
-    await run('demucs', ['--two-stems=vocals', '-o', ${JSON.stringify(tmpDir)}, ${JSON.stringify(audioWav)}]);
+    await run(${JSON.stringify(demucsBin)}, ['--two-stems=vocals', '-o', ${JSON.stringify(tmpDir)}, ${JSON.stringify(audioWav)}]);
     writeFileSync(${JSON.stringify(demucsDoneFile)}, new Date().toISOString());
     log('[bg] Step 2/3: Demucs done.');
 
@@ -210,7 +215,7 @@ async function main() {
     }
     vocalsFile = found;
 
-    await run('ffmpeg', ['-y', '-i', ${JSON.stringify(filePath)}, '-i', vocalsFile, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-map', '0:v:0', '-map', '1:a:0', ${JSON.stringify(processedPath)}]);
+    await run(${JSON.stringify(ffmpegBin)}, ['-y', '-i', ${JSON.stringify(filePath)}, '-i', vocalsFile, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-map', '0:v:0', '-map', '1:a:0', ${JSON.stringify(processedPath)}]);
 
     writeFileSync(${JSON.stringify(completedFile)}, new Date().toISOString());
     log('[bg] Complete: ${name}');
@@ -248,7 +253,7 @@ main();
 export function registerSeparateVocals(server: McpServer): void {
   server.tool(
     "separate_vocals",
-    "Start Demucs vocal separation in the BACKGROUND, reading from {dramaId}/raw/. Returns immediately — use check_vocals_status to poll until allDone=true. After completion, call build_video with the same dramaId. Uses concurrency control to avoid overloading CPU (default: 2 simultaneous processes, configurable via maxConcurrency).",
+    "Start Demucs vocal separation in the BACKGROUND, reading from {dramaId}/raw/. Returns immediately — you MUST immediately call check_vocals_status and keep polling every 30s until allDone=true. Do NOT ask the user whether to poll — always auto-poll. When allDone=true, immediately call build_video with the same dramaId. The full pipeline is: separate_vocals → (auto-poll check_vocals_status until allDone) → build_video → upload_video. Uses concurrency control (default: 2 simultaneous processes, configurable via maxConcurrency).",
     {
       dramaId: z.string().describe("Drama ID (same as used in download_episodes)"),
       startEp: z.number().default(1).describe("Start episode number"),
@@ -257,6 +262,9 @@ export function registerSeparateVocals(server: McpServer): void {
     },
     async ({ dramaId, startEp, endEp, maxConcurrency: mc }) => {
       validateDramaId(dramaId);
+
+      // Ensure ffmpeg and demucs are available before starting any jobs
+      await ensureDeps();
 
       // Update global maxConcurrency if specified
       if (mc && mc >= 1) {
@@ -346,7 +354,7 @@ export function registerSeparateVocals(server: McpServer): void {
 export function registerCheckVocalsStatus(server: McpServer): void {
   server.tool(
     "check_vocals_status",
-    "Poll vocal separation progress. Call repeatedly (every 30-60s) until allDone=true. Returns 'completed', 'running', 'pending', or 'failed' per episode. Only proceed to build_video when allDone=true. Also triggers the concurrency scheduler to start queued jobs when slots become available.",
+    "Poll vocal separation progress. You MUST call this repeatedly every 30s after separate_vocals until allDone=true — NEVER stop polling to ask the user. Returns 'completed', 'running', 'pending', or 'failed' per episode. Only proceed to build_video when allDone=true. Also triggers the concurrency scheduler to start queued jobs when slots become available.",
     {
       dramaId: z.string().describe("Drama ID"),
     },
@@ -491,6 +499,27 @@ export function registerCheckVocalsStatus(server: McpServer): void {
               null,
               2
             ),
+          },
+        ],
+      };
+    }
+  );
+}
+
+// ── check_deps: Verify ffmpeg and demucs availability ─────────────────────────
+
+export function registerCheckDeps(server: McpServer): void {
+  server.tool(
+    "check_deps",
+    "Check if ffmpeg and demucs are installed. Returns availability status, paths, and versions. If demucs is missing, run separate_vocals to auto-install it, or install manually.",
+    {},
+    async () => {
+      const status = await checkDeps();
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(status, null, 2),
           },
         ],
       };
